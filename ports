@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+import curses
+import re
+import shlex
+import shutil
+import subprocess
+import time
+from collections import defaultdict
+
+# Config
+LO_PORT, HI_PORT = 3000, 9999
+REFRESH_SECS_DEFAULT = 2.0
+
+LSOF_FIELDS = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
+NAME_RE = re.compile(r"^(?P<local>\S+?)(?:->(?P<remote>\S+))?(?: \((?P<state>[A-Z]+)\))?$")
+DOCKER_PS_FMT = "{{.ID}} {{.Names}} {{.Image}} {{.Ports}}"
+
+def run(cmd: str):
+    try:
+        return subprocess.check_output(shlex.split(cmd), stderr=subprocess.DEVNULL, text=True)
+    except Exception:
+        return ""
+
+# ---------- lsof ----------
+def run_lsof(only_listen: bool):
+    cmd = f"lsof -nP -iTCP:{LO_PORT}-{HI_PORT}"
+    if only_listen:
+        cmd += " -sTCP:LISTEN"
+    out = run(cmd)
+    return out.splitlines() if out else []
+
+def parse_lsof(lines):
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("COMMAND") and "NAME" in ln:
+            header_idx = i
+            break
+    if header_idx is None:
+        return []
+
+    entries = []
+    for ln in lines[header_idx + 1:]:
+        if not ln.strip():
+            continue
+        parts = ln.split(None, len(LSOF_FIELDS) - 1)
+        if len(parts) < len(LSOF_FIELDS):
+            continue
+        row = dict(zip(LSOF_FIELDS, parts))
+        m = NAME_RE.match(row["NAME"])
+        if not m:
+            continue
+        local = m.group("local") or ""
+        remote = m.group("remote") or ""
+        state = m.group("state") or ""
+        # Extract port from local
+        port = None
+        if local.startswith('['):  # IPv6 like [::1]:5173
+            try:
+                port = int(local.rsplit(':', 1)[1])
+            except Exception:
+                port = None
+        else:
+            if ':' in local:
+                try:
+                    port = int(local.rsplit(':', 1)[1])
+                except Exception:
+                    port = None
+        if port is None:
+            continue
+
+        entries.append({
+            "proc": row["COMMAND"],
+            "pid": row["PID"],
+            "user": row["USER"],
+            "port": port,
+            "state": state,
+            "local": local,
+            "remote": remote,
+            "container": "",
+            "image": "",
+            "cport": "",
+            "source": "host",
+        })
+
+    entries.sort(key=lambda e: (e["port"], int(e["pid"]) if e["pid"].isdigit() else 0))
+    return entries
+
+# ---------- docker ----------
+PORT_MAP_RE = re.compile(
+    r"(?:(?P<hostip>\*|[\[\]0-9a-fA-F:\.]+):)?(?P<hport>\d+)"
+    r"\s*->\s*(?P<cport>\d+(?:-\d+)?)/(?P<proto>\w+)"
+)
+
+def docker_port_map():
+    if not shutil.which("docker"):
+        return {}, []
+
+    out = run(f"docker ps --format '{DOCKER_PS_FMT}'")
+    host_map = {}
+    docker_rows = []
+    if not out:
+        return host_map, docker_rows
+
+    for line in out.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) < 4:
+            continue
+        cid, name, image, ports_str = parts[0], parts[1], parts[2], parts[3]
+        if not ports_str:
+            continue
+        for seg in ports_str.split(","):
+            seg = seg.strip()
+            m = PORT_MAP_RE.search(seg)
+            if not m:
+                continue
+            hport = int(m.group("hport"))
+            if not (LO_PORT <= hport <= HI_PORT):
+                continue
+            cport = m.group("cport")
+            proto = m.group("proto")
+            info = {"container": name, "image": image, "cport": cport, "proto": proto, "id": cid}
+            host_map.setdefault(hport, []).append(info)
+            docker_rows.append({
+                "proc": "docker-proxy",
+                "pid": "",
+                "user": "",
+                "port": hport,
+                "state": "PUBLISHED",
+                "local": f"0.0.0.0:{hport}",
+                "remote": "",
+                "container": name,
+                "image": image,
+                "cport": f"{cport}/{proto}",
+                "source": "docker",
+            })
+    docker_rows.sort(key=lambda e: (e["port"], e["container"]))
+    return host_map, docker_rows
+
+# ---------- merge and aggregate ----------
+def merge_rows(host_rows, docker_host_map, docker_only_rows, show_docker_only):
+    merged = []
+    for r in host_rows:
+        hport = r["port"]
+        infos = docker_host_map.get(hport, [])
+        if infos:
+            for info in infos:
+                r2 = dict(r)
+                r2["container"] = info["container"]
+                r2["image"] = info["image"]
+                r2["cport"] = f"{info['cport']}/{info.get('proto','')}".rstrip('/')
+                merged.append(r2)
+        else:
+            merged.append(r)
+    if show_docker_only:
+        host_ports_present = {r["port"] for r in merged}
+        for drow in docker_only_rows:
+            if drow["port"] not in host_ports_present:
+                merged.append(drow)
+    merged.sort(key=lambda e: (e["port"], e.get("container",""), e.get("proc","")))
+    return merged
+
+def aggregate_unique_ports(rows):
+    by_port = defaultdict(lambda: {
+        "port": None,
+        "states": set(),
+        "procs": [],
+        "containers": [],
+        "images": [],
+        "locals": set(),
+        "remotes": set(),
+        "cports": set(),
+        "has_host_listener": False,
+        "has_docker": False,
+    })
+
+    for r in rows:
+        p = r["port"]
+        agg = by_port[p]
+        agg["port"] = p
+        if r.get("state"): agg["states"].add(r["state"])
+        if r.get("proc"): agg["procs"].append(r["proc"])
+        if r.get("container"): agg["containers"].append(r["container"])
+        if r.get("image"): agg["images"].append(r["image"])
+        if r.get("local"): agg["locals"].add(r["local"])
+        if r.get("remote"): agg["remotes"].add(r["remote"])
+        if r.get("cport"): agg["cports"].add(r["cport"])
+        if r.get("source") == "host": agg["has_host_listener"] = True
+        if r.get("source") == "docker": agg["has_docker"] = True
+
+    def uniq_keep_order(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    out_rows = []
+    for p, agg in by_port.items():
+        procs = uniq_keep_order(agg["procs"])
+        containers = uniq_keep_order(agg["containers"])
+        images = uniq_keep_order(agg["images"])
+
+        state = "LISTEN" if "LISTEN" in agg["states"] else (
+            "PUBLISHED" if "PUBLISHED" in agg["states"] else (
+                "ESTABLISHED" if "ESTABLISHED" in agg["states"] else ",".join(sorted(agg["states"])) or ""
+            )
+        )
+
+        def summarize(lst, cap=3):
+            if not lst:
+                return ""
+            if len(lst) <= cap:
+                return ", ".join(lst)
+            return ", ".join(lst[:cap]) + f" +{len(lst)-cap} more"
+
+        local_hint = next(iter(agg["locals"]), f"*:{p}")
+        cports_hint = summarize(sorted(agg["cports"])) if agg["cports"] else ""
+        note = f"{local_hint}"
+        if cports_hint:
+            note += f"  [{cports_hint}]"
+
+        out_rows.append({
+            "port": p,
+            "state": state,
+            "proc_summary": summarize(procs),
+            "container_summary": summarize(containers),
+            "image_summary": summarize(images),
+            "note": note,
+            "source": "mixed" if (agg["has_host_listener"] and agg["has_docker"]) else (
+                "docker" if agg["has_docker"] else "host"
+            ),
+        })
+
+    out_rows.sort(key=lambda r: r["port"])
+    return out_rows
+
+# ---------- UI helpers ----------
+def safe_addnstr(stdscr, y, x, s, maxw):
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    width = max(0, min(maxw, w - x))
+    if width <= 0:
+        return
+    stdscr.addnstr(y, x, s[:width], width)
+
+def draw_header(stdscr, only_listen, refresh_secs, show_docker_only, unique_mode):
+    h, w = stdscr.getmaxyx()
+    mode = "UNIQUE" if unique_mode else "DETAIL"
+    title = (
+        f"Ports managment by Adar Bahar | "
+        f" TCP {LO_PORT}-{HI_PORT}  "
+        f"[u] mode: {mode}  "
+        f"[l] only LISTEN: {'ON' if only_listen else 'OFF'}  "
+        f"[d] show docker-only: {'ON' if show_docker_only else 'OFF'}  "
+        f"[+/ -] refresh: {refresh_secs:.1f}s  [q] quit"
+    )
+    stdscr.attron(curses.A_BOLD)
+    safe_addnstr(stdscr, 0, 0, title.ljust(w), w)
+    stdscr.attroff(curses.A_BOLD)
+    if h >= 2:
+        try:
+            stdscr.hline(1, 0, curses.ACS_HLINE, max(0, w))
+        except curses.error:
+            pass
+
+    if unique_mode:
+        header = f"{'PORT':>6}  {'STATE':<12} {'PROCESSES':<28} {'CONTAINERS':<24} {'IMAGES':<24} {'LOCAL / CONTAINER PORTS'}"
+    else:
+        header = (
+            f"{'PORT':>6}  {'STATE':<12} {'PID':>7}  {'USER':<10} "
+            f"{'PROCESS':<16} {'CONTAINER':<18} {'IMAGE':<18} {'LOCAL → REMOTE / CONTAINER PORT'}"
+        )
+    safe_addnstr(stdscr, 2, 0, header.ljust(w), w)
+    if h >= 4:
+        try:
+            stdscr.hline(3, 0, curses.ACS_HLINE, max(0, w))
+        except curses.error:
+            pass
+
+def draw_rows_detail(stdscr, rows, start_line=4):
+    h, w = stdscr.getmaxyx()
+    if h <= start_line + 1:
+        return
+    max_rows = max(0, h - start_line - 2)
+    for i in range(max_rows):
+        y = start_line + i
+        if i >= len(rows):
+            safe_addnstr(stdscr, y, 0, " " * (w - 1), w - 1)
+            continue
+        r = rows[i]
+        state = r.get("state", "") or ""
+        left = (
+            f"{r['port']:>6}  {state:<12} {r.get('pid',''):>7}  {r.get('user',''):<10} "
+            f"{r.get('proc',''):<16} {r.get('container',''):<18} {r.get('image',''):<18} "
+        )
+        right = r['local']
+        if r.get("remote"):
+            right += f" → {r['remote']}"
+        if r.get("cport"):
+            right += f"   [{r['cport']}]"
+
+        if state in ("LISTEN", "PUBLISHED"):
+            stdscr.attron(curses.color_pair(2))
+        elif state == "ESTABLISHED":
+            stdscr.attron(curses.color_pair(3))
+        else:
+            stdscr.attron(curses.color_pair(1))
+
+        safe_addnstr(stdscr, y, 0, left + right, w - 1)
+
+        stdscr.attroff(curses.color_pair(1))
+        stdscr.attroff(curses.color_pair(2))
+        stdscr.attroff(curses.color_pair(3))
+
+def draw_rows_unique(stdscr, rows, start_line=4):
+    h, w = stdscr.getmaxyx()
+    if h <= start_line + 1:
+        return
+    max_rows = max(0, h - start_line - 2)
+    for i in range(max_rows):
+        y = start_line + i
+        if i >= len(rows):
+            safe_addnstr(stdscr, y, 0, " " * (w - 1), w - 1)
+            continue
+        r = rows[i]
+        state = r.get("state", "") or ""
+        left = (
+            f"{r['port']:>6}  {state:<12} {r.get('proc_summary',''):<28} "
+            f"{r.get('container_summary',''):<24} {r.get('image_summary',''):<24} "
+        )
+        right = r.get("note","")
+
+        if state in ("LISTEN", "PUBLISHED"):
+            stdscr.attron(curses.color_pair(2))
+        elif state == "ESTABLISHED":
+            stdscr.attron(curses.color_pair(3))
+        else:
+            stdscr.attron(curses.color_pair(1))
+
+        safe_addnstr(stdscr, y, 0, left + right, w - 1)
+
+        stdscr.attroff(curses.color_pair(1))
+        stdscr.attroff(curses.color_pair(2))
+        stdscr.attroff(curses.color_pair(3))
+
+def draw_footer(stdscr):
+    h, w = stdscr.getmaxyx()
+    if h >= 6:
+        try:
+            stdscr.hline(h - 2, 0, curses.ACS_HLINE, max(0, w))
+        except curses.error:
+            pass
+        msg = "Keys: q quit | u unique/detail | l only LISTEN | d docker-only | +/- refresh | Tip: use sudo for full lsof visibility"
+        safe_addnstr(stdscr, h - 1, 0, msg, w - 1)
+
+def main(stdscr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, -1, -1)                 # default
+    curses.init_pair(2, curses.COLOR_GREEN, -1) # LISTEN/PUBLISHED
+    curses.init_pair(3, curses.COLOR_CYAN, -1)  # ESTABLISHED
+
+    refresh_secs = REFRESH_SECS_DEFAULT
+    only_listen = True          # default ON
+    show_docker_only = True
+    unique_mode = True          # default ON
+    stdscr.nodelay(True)
+
+    last_refresh = 0
+    rows_detail = []
+    rows_unique = []
+
+    while True:
+        now = time.time()
+        if now - last_refresh >= refresh_secs:
+            lsof_lines = run_lsof(only_listen)
+            host_rows = parse_lsof(lsof_lines)
+            docker_map, docker_only_rows = docker_port_map()
+            rows_detail = merge_rows(host_rows, docker_map, docker_only_rows, show_docker_only)
+            rows_unique = aggregate_unique_ports(rows_detail)
+
+            stdscr.erase()
+            draw_header(stdscr, only_listen, refresh_secs, show_docker_only, unique_mode)
+            if unique_mode:
+                draw_rows_unique(stdscr, rows_unique)
+            else:
+                draw_rows_detail(stdscr, rows_detail)
+            draw_footer(stdscr)
+            stdscr.refresh()
+            last_refresh = now
+
+        try:
+            ch = stdscr.getch()
+        except curses.error:
+            ch = -1
+
+        if ch == ord('q'):
+            break
+        elif ch == ord('l'):
+            only_listen = not only_listen
+            last_refresh = 0
+        elif ch == ord('d'):
+            show_docker_only = not show_docker_only
+            last_refresh = 0
+        elif ch == ord('u'):
+            unique_mode = not unique_mode
+            last_refresh = 0
+        elif ch in (ord('+'), ord('=')):
+            refresh_secs = max(0.2, refresh_secs - 0.2)
+            last_refresh = 0
+        elif ch in (ord('-'), ord('_')):
+            refresh_secs = min(10.0, refresh_secs + 0.2)
+            last_refresh = 0
+
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    if not shutil.which("lsof"):
+        print("Error: lsof not found. Install with: brew install lsof")
+        raise SystemExit(1)
+    curses.wrapper(main)
