@@ -789,7 +789,7 @@ def draw_header(screen, only_listen: bool, refresh_secs: float, show_docker_only
 
     # Create title line
     title = (
-        f"Ports Manager by Adar Bahar | https://github.com/AdarBahar/ports | TCP {LO_PORT}-{HI_PORT} | "
+        f"Ports Manager by Adar Bahar v{VERSION} | https://github.com/AdarBahar/ports | TCP {LO_PORT}-{HI_PORT} | "  # cspell:disable-line
         f"[u] {mode} | [l] LISTEN: {'ON' if only_listen else 'OFF'} | "
         f"[d] Docker: {'ON' if show_docker_only else 'OFF'} | "
         f"[+/-] {refresh_secs:.1f}s | [?] help | [q] quit"
