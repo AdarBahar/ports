@@ -12,7 +12,10 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
+import urllib.request
+import urllib.error
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Any, Tuple
@@ -20,6 +23,11 @@ from typing import Dict, List, Set, Optional, Any, Tuple
 # =========================
 # Configuration
 # =========================
+VERSION = "2.1.0"  # Current version
+GITHUB_REPO = "AdarBahar/ports"  # GitHub repository  # cspell:disable-line
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ports"
+
 LO_PORT, HI_PORT = 3000, 9999
 REFRESH_SECS_DEFAULT = 2.0
 COMMAND_TIMEOUT_SECS = 10.0  # Timeout for external commands
@@ -102,6 +110,129 @@ class AggregatedPort:
     cports: Set[str] = field(default_factory=set)  # cspell:disable-line
     has_host_listener: bool = False
     has_docker: bool = False
+
+# =========================
+# Version Management
+# =========================
+def parse_version(version_str: str) -> Tuple[int, int, int]:
+    """Parse version string into tuple for comparison."""
+    try:
+        # Remove 'v' prefix if present and split by dots
+        clean_version = version_str.lstrip('v')
+        parts = clean_version.split('.')
+        return (int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+    except (ValueError, IndexError):
+        return (0, 0, 0)
+
+def check_for_updates() -> Optional[str]:
+    """Check GitHub for newer version. Returns new version string if available."""
+    try:
+        with urllib.request.urlopen(GITHUB_API_URL, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            latest_version = data.get('tag_name', '').lstrip('v')
+
+            current = parse_version(VERSION)
+            latest = parse_version(latest_version)
+
+            if latest > current:
+                return latest_version
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError):
+        pass  # Silently fail - don't interrupt user experience
+
+    return None
+
+def download_update() -> bool:
+    """Download the latest version from GitHub. Returns True if successful."""
+    # Get current script path
+    current_script = os.path.abspath(__file__)
+    backup_script = current_script + ".backup"
+
+    try:
+        # Create backup of current version
+        shutil.copy2(current_script, backup_script)
+
+        # Download new version
+        with urllib.request.urlopen(GITHUB_RAW_URL, timeout=30) as response:
+            new_content = response.read()
+
+        # Write new version
+        with open(current_script, 'wb') as f:
+            f.write(new_content)
+
+        # Make executable
+        os.chmod(current_script, 0o755)
+
+        return True
+    except (urllib.error.URLError, OSError, IOError):
+        # Restore backup if download failed
+        try:
+            if os.path.exists(backup_script):
+                shutil.copy2(backup_script, current_script)
+        except (OSError, IOError):
+            pass
+        return False
+
+def restart_application() -> None:
+    """Restart the application with the same arguments."""
+    try:
+        # Clean up backup file
+        backup_script = os.path.abspath(__file__) + ".backup"
+        if os.path.exists(backup_script):
+            os.remove(backup_script)
+    except OSError:
+        pass
+
+    # Restart with same arguments
+    os.execv(sys.executable, [sys.executable] + sys.argv)  # cspell:disable-line
+
+def show_update_prompt(screen, new_version: str) -> bool:
+    """Show update prompt and return True if user wants to update."""
+    try:
+        height, width = screen.getmaxyx()  # cspell:disable-line
+    except curses.error:
+        height, width = 24, 80
+
+    # Clear screen and show update message
+    screen.clear()
+
+    update_text = [
+        "🚀 UPDATE AVAILABLE",
+        "",
+        f"Current version: {VERSION}",
+        f"Latest version:  {new_version}",
+        "",
+        "A newer version of Ports Manager is available!",
+        "",
+        "Press 'u' to update automatically",
+        "Press any other key to continue with current version",
+        "",
+        "The update will:",
+        "• Download the latest version from GitHub",
+        "• Backup your current version",
+        "• Restart the application automatically",
+    ]
+
+    # Center the text
+    start_y = max(1, (height - len(update_text)) // 2)
+
+    for i, line in enumerate(update_text):
+        y = start_y + i
+        if y < height - 1:
+            x = max(0, (width - len(line)) // 2)
+            safe_addnstr(screen, y, x, line, width - x)  # cspell:disable-line
+
+    screen.refresh()
+
+    # Wait for user input
+    while True:
+        try:
+            key = screen.getch()  # cspell:disable-line
+            if key == ord('u') or key == ord('U'):
+                return True
+            elif key != -1:  # Any other key
+                return False
+        except curses.error:
+            return False
 
 # =========================
 # Utility Functions
@@ -658,10 +789,10 @@ def draw_header(screen, only_listen: bool, refresh_secs: float, show_docker_only
 
     # Create title line
     title = (
-        f"Ports Manager | TCP {LO_PORT}-{HI_PORT} | "
+        f"Ports Manager by Adar Bahar | https://github.com/AdarBahar/ports | TCP {LO_PORT}-{HI_PORT} | "
         f"[u] {mode} | [l] LISTEN: {'ON' if only_listen else 'OFF'} | "
         f"[d] Docker: {'ON' if show_docker_only else 'OFF'} | "
-        f"[+/-] {refresh_secs:.1f}s | [a] alias | [x] del | [g] proc | [?] help | [q] quit"
+        f"[+/-] {refresh_secs:.1f}s | [?] help | [q] quit"
     )
 
     # Draw title with bold formatting
@@ -947,6 +1078,29 @@ def main(screen) -> None:
     """Main application loop with debouncing for rapid key presses."""
     initialize_curses(screen)
 
+    # Check for updates (non-blocking)
+    try:
+        new_version = check_for_updates()
+        if new_version:
+            if show_update_prompt(screen, new_version):
+                # User wants to update
+                screen.clear()
+                screen.addstr(0, 0, "Downloading update...")  # cspell:disable-line
+                screen.refresh()
+
+                if download_update():
+                    screen.addstr(1, 0, "Update successful! Restarting...")  # cspell:disable-line
+                    screen.refresh()
+                    time.sleep(1)
+                    restart_application()
+                else:
+                    screen.addstr(1, 0, "Update failed. Continuing with current version...")  # cspell:disable-line
+                    screen.refresh()
+                    time.sleep(2)
+    except Exception:
+        # Don't let update check interfere with main functionality
+        pass
+
     # Application state
     refresh_secs = REFRESH_SECS_DEFAULT
     only_listen = True
@@ -1184,10 +1338,148 @@ def check_dependencies() -> None:
         print("Error: lsof not found. Install with: brew install lsof (macOS) or apt install lsof (Linux)")
         raise SystemExit(1)
 
+def show_version() -> None:
+    """Show version information."""
+    print(f"Ports Manager v{VERSION}")
+    print(f"Repository: https://github.com/{GITHUB_REPO}")
+    print("Copyright (c) 2024-2025 Adar Bahar")  # cspell:disable-line
+    print("Licensed under MIT License")
+
+def main_with_update_check(screen) -> None:
+    """Wrapper for main that includes update checking."""
+    # Skip update check if --no-update flag is present
+    if "--no-update" in sys.argv:
+        return main_without_update_check(screen)
+    return main(screen)
+
+def main_without_update_check(screen) -> None:
+    """Main function without update checking."""
+    initialize_curses(screen)
+
+    # Application state
+    refresh_secs = REFRESH_SECS_DEFAULT
+    only_listen = True
+    show_docker_only = True
+    unique_mode = True
+    last_refresh = 0.0
+    last_key_time = 0.0  # For debouncing rapid key presses
+    key_debounce_delay = 0.1  # Minimum time between key actions
+
+    # Load aliases
+    aliases = load_aliases()
+
+    # Data storage
+    detail_entries: List[PortEntry] = []
+    unique_rows: List[Dict[str, Any]] = []
+
+    # Main application loop (same as main() but without update check)
+    while True:
+        current_time = time.time()
+
+        # Refresh data if needed
+        if current_time - last_refresh >= refresh_secs:
+            # Get lsof data
+            lsof_lines = run_lsof(only_listen)
+            host_entries = parse_lsof(lsof_lines)
+
+            # Get Docker data
+            docker_host_map, docker_only_entries = docker_port_map()
+
+            # Merge and aggregate
+            detail_entries = merge_rows(host_entries, docker_host_map, docker_only_entries, show_docker_only)
+            unique_rows = aggregate_unique_ports(detail_entries)
+
+            # Redraw screen
+            screen.erase()
+            draw_header(screen, only_listen, refresh_secs, show_docker_only, unique_mode)
+
+            if unique_mode:
+                draw_rows_unique(screen, unique_rows, aliases)
+            else:
+                draw_rows_detail(screen, detail_entries, aliases)
+
+            draw_footer(screen)
+            screen.refresh()
+            last_refresh = current_time
+
+        # Handle input with debouncing
+        try:
+            key = screen.getch()  # cspell:disable-line
+        except curses.error:
+            key = -1
+
+        # Process key if enough time has passed (debouncing)
+        current_time = time.time()
+        if key != -1 and (current_time - last_key_time) >= key_debounce_delay:
+            last_key_time = current_time
+
+            if key == ord('q'):
+                break
+            elif key == ord('l'):
+                only_listen = not only_listen
+                last_refresh = 0
+            elif key == ord('d'):
+                show_docker_only = not show_docker_only
+                last_refresh = 0
+            elif key == ord('u'):
+                unique_mode = not unique_mode
+                last_refresh = 0
+            elif key in (ord('+'), ord('=')):
+                refresh_secs = max(0.2, refresh_secs - 0.2)
+                last_refresh = 0
+            elif key in (ord('-'), ord('_')):
+                refresh_secs = min(10.0, refresh_secs + 0.2)
+                last_refresh = 0
+            elif key == ord('a'):
+                # Add/Edit per-entry alias
+                handle_add_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('x'):
+                # Delete per-entry alias
+                handle_delete_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('g'):
+                # Set/Edit per-process alias
+                handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('?'):
+                draw_help(screen)
+                last_refresh = 0
+
+        time.sleep(0.05)
+
 if __name__ == "__main__":
     try:
+        # Handle command line arguments
+        if "--version" in sys.argv or "-v" in sys.argv:
+            show_version()
+            sys.exit(0)
+        elif "--help" in sys.argv or "-h" in sys.argv:
+            print("Ports Manager - Monitor network ports and processes")
+            print(f"Version: {VERSION}")
+            print()
+            print("Usage: ports [options]")
+            print()
+            print("Options:")
+            print("  -h, --help       Show this help message")
+            print("  -v, --version    Show version information")
+            print("  --no-update      Skip automatic update check")
+            print()
+            print("Controls:")
+            print("  q       - quit")
+            print("  u       - toggle unique/detail mode")
+            print("  l       - toggle LISTEN-only filter")
+            print("  d       - toggle docker-only rows")
+            print("  + / -   - change refresh speed")
+            print("  a       - add/edit alias")
+            print("  x       - delete alias")
+            print("  g       - set process alias")
+            print("  ?       - show help")
+            print("  ESC     - cancel current operation")
+            sys.exit(0)
+
         check_dependencies()
-        curses.wrapper(main)
+        curses.wrapper(main_with_update_check)
     except KeyboardInterrupt:
         print("\nExiting...")
     except Exception as e:
