@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024-2025 Adar Bahar  # cspell:disable-line
 """
 Ports Manager - A terminal-based tool for monitoring network ports and processes.
 Optimized version with improved performance and code structure.
@@ -20,13 +22,23 @@ from typing import Dict, List, Set, Optional, Any, Tuple
 # =========================
 LO_PORT, HI_PORT = 3000, 9999
 REFRESH_SECS_DEFAULT = 2.0
+COMMAND_TIMEOUT_SECS = 10.0  # Timeout for external commands
 ALIASES_PATH = os.path.expanduser("~/.ports_aliases.json")
 
 # Regex patterns (compiled once for performance)
 LSOF_FIELDS = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
 NAME_RE = re.compile(r"^(?P<local>\S+?)(?:->(?P<remote>\S+))?(?: \((?P<state>[A-Z]+)\))?$")
+
+# Docker port mapping regex - matches patterns like:
+# "0.0.0.0:8080->8080/tcp" or "*:3000->3000/tcp" or "[::]:5432->5432/tcp"
+# Groups: hostip (optional), hport (host port), cport (container port), proto (protocol)  # cspell:disable-line
+_HOST_IP_PATTERN = r"(?P<hostip>\*|[\[\]0-9a-fA-F:\.]+):"  # Host IP (IPv4/IPv6/wildcard)  # cspell:disable-line
+_HOST_PORT_PATTERN = r"(?P<hport>\d+)"                     # Host port number  # cspell:disable-line
+_CONTAINER_PORT_PATTERN = r"(?P<cport>\d+(?:-\d+)?)"       # Container port (single or range)  # cspell:disable-line
+_PROTOCOL_PATTERN = r"(?P<proto>\w+)"                      # Protocol (tcp/udp)
+
 PORT_MAP_RE = re.compile(
-    r"(?:(?P<hostip>\*|[\[\]0-9a-fA-F:\.]+):)?(?P<hport>\d+)\s*->\s*(?P<cport>\d+(?:-\d+)?)/(?P<proto>\w+)"  # cspell:disable-line
+    rf"(?:{_HOST_IP_PATTERN})?{_HOST_PORT_PATTERN}\s*->\s*{_CONTAINER_PORT_PATTERN}/{_PROTOCOL_PATTERN}"
 )
 DOCKER_PS_FMT = "{{.ID}} {{.Names}} {{.Image}} {{.Ports}}"
 
@@ -90,14 +102,17 @@ class AggregatedPort:
 # =========================
 # Utility Functions
 # =========================
-def run_command(cmd: str) -> str:
+def run_command(cmd: str, timeout: Optional[float] = None) -> str:
     """Execute a shell command and return output, or empty string on error."""
+    if timeout is None:
+        timeout = COMMAND_TIMEOUT_SECS
+
     try:
         return subprocess.check_output(
             shlex.split(cmd),
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=10  # Prevent hanging
+            timeout=timeout
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return ""
@@ -535,21 +550,32 @@ def safe_addnstr(screen, y: int, x: int, text: str, max_width: int) -> None:  # 
         pass
 
 def get_user_input(screen, prompt: str) -> str:
-    """Get user input from the bottom line of the screen."""
+    """Get user input from the bottom line of the screen with resize handling."""
     curses.echo()
     try:
-        height, width = screen.getmaxyx()  # cspell:disable-line
+        # Handle potential terminal resize during input
+        try:
+            height, width = screen.getmaxyx()  # cspell:disable-line
+        except curses.error:
+            # Terminal might be resizing, use safe defaults
+            height, width = 24, 80
+
         input_line = height - 1
 
         # Clear the line and show prompt
-        screen.move(input_line, 0)
-        screen.clrtoeol()  # cspell:disable-line
-        safe_addnstr(screen, input_line, 0, prompt, width - 1)  # cspell:disable-line
-        screen.refresh()
-
-        # Get user input
         try:
-            user_bytes = screen.getstr(input_line, len(prompt), 256)  # cspell:disable-line
+            screen.move(input_line, 0)
+            screen.clrtoeol()  # cspell:disable-line
+            safe_addnstr(screen, input_line, 0, prompt, width - 1)  # cspell:disable-line
+            screen.refresh()
+        except curses.error:
+            # Handle resize during drawing
+            pass
+
+        # Get user input with resize protection
+        try:
+            max_input_len = max(10, width - len(prompt) - 2)  # Leave some margin
+            user_bytes = screen.getstr(input_line, len(prompt), max_input_len)  # cspell:disable-line
             return user_bytes.decode("utf-8").strip()
         except (UnicodeDecodeError, curses.error):
             return ""
@@ -825,7 +851,7 @@ def initialize_curses(screen) -> None:
     screen.nodelay(True)  # Non-blocking input  # cspell:disable-line
 
 def main(screen) -> None:
-    """Main application loop."""
+    """Main application loop with debouncing for rapid key presses."""
     initialize_curses(screen)
 
     # Application state
@@ -834,6 +860,8 @@ def main(screen) -> None:
     show_docker_only = True
     unique_mode = True
     last_refresh = 0.0
+    last_key_time = 0.0  # For debouncing rapid key presses
+    key_debounce_delay = 0.1  # Minimum time between key actions
 
     # Load aliases
     aliases = load_aliases()
@@ -871,44 +899,49 @@ def main(screen) -> None:
             screen.refresh()
             last_refresh = current_time
 
-        # Handle input
+        # Handle input with debouncing
         try:
             key = screen.getch()  # cspell:disable-line
         except curses.error:
             key = -1
 
-        if key == ord('q'):
-            break
-        elif key == ord('l'):
-            only_listen = not only_listen
-            last_refresh = 0
-        elif key == ord('d'):
-            show_docker_only = not show_docker_only
-            last_refresh = 0
-        elif key == ord('u'):
-            unique_mode = not unique_mode
-            last_refresh = 0
-        elif key in (ord('+'), ord('=')):
-            refresh_secs = max(0.2, refresh_secs - 0.2)
-            last_refresh = 0
-        elif key in (ord('-'), ord('_')):
-            refresh_secs = min(10.0, refresh_secs + 0.2)
-            last_refresh = 0
-        elif key == ord('a'):
-            # Add/Edit per-entry alias
-            handle_add_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
-            last_refresh = 0
-        elif key == ord('x'):
-            # Delete per-entry alias
-            handle_delete_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
-            last_refresh = 0
-        elif key == ord('g'):
-            # Set/Edit per-process alias
-            handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
-            last_refresh = 0
-        elif key == ord('?'):
-            draw_help(screen)
-            last_refresh = 0
+        # Process key if enough time has passed (debouncing)
+        current_time = time.time()
+        if key != -1 and (current_time - last_key_time) >= key_debounce_delay:
+            last_key_time = current_time
+
+            if key == ord('q'):
+                break
+            elif key == ord('l'):
+                only_listen = not only_listen
+                last_refresh = 0
+            elif key == ord('d'):
+                show_docker_only = not show_docker_only
+                last_refresh = 0
+            elif key == ord('u'):
+                unique_mode = not unique_mode
+                last_refresh = 0
+            elif key in (ord('+'), ord('=')):
+                refresh_secs = max(0.2, refresh_secs - 0.2)
+                last_refresh = 0
+            elif key in (ord('-'), ord('_')):
+                refresh_secs = min(10.0, refresh_secs + 0.2)
+                last_refresh = 0
+            elif key == ord('a'):
+                # Add/Edit per-entry alias
+                handle_add_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('x'):
+                # Delete per-entry alias
+                handle_delete_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('g'):
+                # Set/Edit per-process alias
+                handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+                last_refresh = 0
+            elif key == ord('?'):
+                draw_help(screen)
+                last_refresh = 0
 
         time.sleep(0.05)
 
@@ -919,17 +952,20 @@ def handle_add_alias(
     unique_rows: List[Dict[str, Any]],
     aliases: Dict[str, Dict[str, str]]
 ) -> None:
-    """Handle adding/editing per-entry aliases."""
+    """Handle adding/editing per-entry aliases with validation."""
     current_data = unique_rows if unique_mode else detail_entries
     if not current_data:
+        get_user_input(screen, "No data available. Press Enter to continue...")
         return
 
-    row_input = get_user_input(screen, "Row number to alias: ")
+    row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to alias: ")
     try:
         row_idx = int(row_input) - 1
         if not (0 <= row_idx < len(current_data)):
+            get_user_input(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press Enter...")
             return
     except ValueError:
+        get_user_input(screen, "Invalid input. Please enter a number. Press Enter...")
         return
 
     if unique_mode:
@@ -955,17 +991,20 @@ def handle_delete_alias(
     unique_rows: List[Dict[str, Any]],
     aliases: Dict[str, Dict[str, str]]
 ) -> None:
-    """Handle deleting per-entry aliases."""
+    """Handle deleting per-entry aliases with validation."""
     current_data = unique_rows if unique_mode else detail_entries
     if not current_data:
+        get_user_input(screen, "No data available. Press Enter to continue...")
         return
 
-    row_input = get_user_input(screen, "Row number to clear alias: ")
+    row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to clear alias: ")
     try:
         row_idx = int(row_input) - 1
         if not (0 <= row_idx < len(current_data)):
+            get_user_input(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press Enter...")
             return
     except ValueError:
+        get_user_input(screen, "Invalid input. Please enter a number. Press Enter...")
         return
 
     if unique_mode:
@@ -978,6 +1017,9 @@ def handle_delete_alias(
     if key in aliases["per_entry"]:
         del aliases["per_entry"][key]
         save_aliases(aliases)
+        get_user_input(screen, "Alias deleted. Press Enter to continue...")
+    else:
+        get_user_input(screen, "No alias found for this row. Press Enter to continue...")
 
 def handle_process_alias(
     screen,

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ports-manager"
+version = "2.0.0"
+description = "A powerful terminal-based tool for monitoring network ports and processes"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Adar Bahar", email = "adar.bahar@gmail.com"}
+]
+maintainers = [
+    {name = "Adar Bahar", email = "adar.bahar@gmail.com"}
+]
+keywords = [
+    "ports", "network", "monitoring", "docker", "processes", 
+    "terminal", "curses", "development", "devops"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Terminals",
+    "Topic :: Utilities"
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/AdarBahar/ports"
+Repository = "https://github.com/AdarBahar/ports"
+Issues = "https://github.com/AdarBahar/ports/issues"
+Changelog = "https://github.com/AdarBahar/ports/releases"
+
+[project.scripts]
+ports = "ports:main"
+
+[tool.setuptools]
+py-modules = ["ports"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ports*"]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "flake8",
+    "mypy",
+    "pytest"
+]

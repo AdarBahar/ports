@@ -1,3 +1,5 @@
 todo
 update app (from repo)
 check if there are updates in repo (version number)
+
+click a - menu switch back to menu and I can't enter the id

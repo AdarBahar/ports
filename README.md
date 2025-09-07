@@ -5,6 +5,7 @@ A powerful, optimized terminal-based tool for monitoring network ports and proce
 ![Ports Manager Demo](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-blue)
 ![Python Version](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
+![SPDX License](https://img.shields.io/badge/SPDX--License--Identifier-MIT-blue)
 
 ## ✨ Features
 
@@ -149,7 +150,7 @@ sudo ports
 | `q` | **Quit** | Exit the application |
 | `u` | **Toggle Mode** | Switch between Unique and Detail views |
 | `l` | **LISTEN Filter** | Show only listening sockets |
-| `d` | **Docker Toggle** | Include/exclude Docker-only published ports |
+| `d` | **Docker Toggle** | Include/exclude Docker-published ports without host listeners |
 | `+` / `-` | **Refresh Rate** | Increase/decrease update frequency |
 | `a` | **Add Alias** | Create custom alias for selected row |
 | `x` | **Delete Alias** | Remove alias from selected row |
@@ -184,7 +185,7 @@ sudo ports
 #### Built-in Friendly Names
 Automatic recognition for common services:
 - `nginx` → "Web server"
-- `mysqld` → "MySQL"
+- `mysqld` → "MySQL"  <!-- cspell:disable-line -->
 - `redis-server` → "Redis"
 - `docker-proxy` → "Docker published port"
 - And many more...
