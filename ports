@@ -28,14 +28,19 @@ GITHUB_REPO = "AdarBahar/ports"  # GitHub repository  # cspell:disable-line
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ports"
 
-LO_PORT, HI_PORT = 3000, 9999
+# Default port configuration
+DEFAULT_PORT_RANGES = [(3000, 9999)]  # Default range
 REFRESH_SECS_DEFAULT = 2.0
 COMMAND_TIMEOUT_SECS = 10.0  # Timeout for external commands
 ALIASES_PATH = os.path.expanduser("~/.ports_aliases.json")
+PORTS_CONFIG_PATH = os.path.expanduser("~/.ports_config.json")
 
 # UI Configuration
 MAX_ALIAS_LENGTH = 24  # Maximum characters for alias names
 ALIAS_COLUMN_WIDTH = 24  # Display width for alias column
+
+# Global port configuration (will be set by parse_port_config)
+PORT_RANGES = DEFAULT_PORT_RANGES.copy()
 
 # Regex patterns (compiled once for performance)
 LSOF_FIELDS = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
@@ -110,6 +115,124 @@ class AggregatedPort:
     cports: Set[str] = field(default_factory=set)  # cspell:disable-line
     has_host_listener: bool = False
     has_docker: bool = False
+
+# =========================
+# Port Configuration Management
+# =========================
+def parse_port_specification(port_spec: str) -> List[Tuple[int, int]]:
+    """
+    Parse port specification string into list of (start, end) tuples.
+
+    Supported formats:
+    - Single port: "3000" → [(3000, 3000)]
+    - Range: "3000-5000" → [(3000, 5000)]
+    - Multiple ports: "3000,8080,9000" → [(3000, 3000), (8080, 8080), (9000, 9000)]
+    - Multiple ranges: "3000-5000,8000-9000" → [(3000, 5000), (8000, 9000)]
+    - Mixed: "3000,8000-9000,9999" → [(3000, 3000), (8000, 9000), (9999, 9999)]
+    """
+    ranges = []
+
+    # Split by comma for multiple specifications
+    specs = [spec.strip() for spec in port_spec.split(',')]
+
+    for spec in specs:
+        if not spec:
+            continue
+
+        if '-' in spec:
+            # Range specification
+            try:
+                start_str, end_str = spec.split('-', 1)
+                start_port = int(start_str.strip())
+                end_port = int(end_str.strip())
+
+                if start_port > end_port:
+                    start_port, end_port = end_port, start_port
+
+                if 1 <= start_port <= 65535 and 1 <= end_port <= 65535:
+                    ranges.append((start_port, end_port))
+            except ValueError:
+                continue
+        else:
+            # Single port specification
+            try:
+                port = int(spec.strip())
+                if 1 <= port <= 65535:
+                    ranges.append((port, port))
+            except ValueError:
+                continue
+
+    return ranges
+
+def format_port_ranges(ranges: List[Tuple[int, int]]) -> str:
+    """Format port ranges for display."""
+    if not ranges:
+        return "None"
+
+    formatted = []
+    for start, end in ranges:
+        if start == end:
+            formatted.append(str(start))
+        else:
+            formatted.append(f"{start}-{end}")
+
+    return ", ".join(formatted)
+
+def port_in_ranges(port: int, ranges: List[Tuple[int, int]]) -> bool:
+    """Check if a port is within any of the specified ranges."""
+    return any(start <= port <= end for start, end in ranges)
+
+def save_port_config(ranges: List[Tuple[int, int]]) -> None:
+    """Save port configuration to file."""
+    try:
+        config = {"port_ranges": ranges}
+        with open(PORTS_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except OSError:
+        pass  # Silently fail if can't save
+
+def load_port_config() -> List[Tuple[int, int]]:
+    """Load port configuration from file."""
+    try:
+        if os.path.exists(PORTS_CONFIG_PATH):
+            with open(PORTS_CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                ranges = config.get("port_ranges", DEFAULT_PORT_RANGES)
+                # Validate loaded ranges
+                if isinstance(ranges, list) and all(
+                    isinstance(r, list) and len(r) == 2 and
+                    isinstance(r[0], int) and isinstance(r[1], int)
+                    for r in ranges
+                ):
+                    return [(r[0], r[1]) for r in ranges]
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+
+    return DEFAULT_PORT_RANGES.copy()
+
+def get_port_range_summary(ranges: List[Tuple[int, int]]) -> str:
+    """Get a short summary of port ranges for display."""
+    if not ranges:
+        return "None"
+
+    if len(ranges) == 1:
+        start, end = ranges[0]
+        if start == end:
+            return str(start)
+        else:
+            return f"{start}-{end}"
+
+    # Multiple ranges - show first and count
+    first_range = ranges[0]
+    if first_range[0] == first_range[1]:
+        first_str = str(first_range[0])
+    else:
+        first_str = f"{first_range[0]}-{first_range[1]}"
+
+    if len(ranges) == 2:
+        return f"{first_str}, ..."
+    else:
+        return f"{first_str}, +{len(ranges)-1} more"
 
 # =========================
 # Version Management
@@ -372,11 +495,37 @@ def resolve_alias_for_unique_row(row: Dict[str, Any], aliases: Dict[str, Dict[st
 # =========================
 # lsof Processing
 # =========================
-def run_lsof(only_listen: bool) -> List[str]:
-    """Run lsof command and return output lines."""
-    cmd = f"lsof -nP -iTCP:{LO_PORT}-{HI_PORT}"
+def build_lsof_command(port_ranges: List[Tuple[int, int]], only_listen: bool) -> str:
+    """Build lsof command for specified port ranges."""
+    # Build port specifications for lsof
+    port_specs = []
+    for start, end in port_ranges:
+        if start == end:
+            port_specs.append(str(start))
+        else:
+            port_specs.append(f"{start}-{end}")
+
+    if not port_specs:
+        return ""
+
+    # Join multiple ranges with commas for lsof
+    port_arg = ",".join(port_specs)
+    cmd = f"lsof -nP -iTCP:{port_arg}"
+
     if only_listen:
         cmd += " -sTCP:LISTEN"
+
+    return cmd
+
+def run_lsof(only_listen: bool, port_ranges: Optional[List[Tuple[int, int]]] = None) -> List[str]:
+    """Run lsof command and return output lines."""
+    if port_ranges is None:
+        port_ranges = PORT_RANGES
+
+    cmd = build_lsof_command(port_ranges, only_listen)
+    if not cmd:
+        return []
+
     output = run_command(cmd)
     return output.splitlines() if output else []
 
@@ -491,7 +640,7 @@ def docker_port_map() -> Tuple[Dict[int, List[DockerInfo]], List[PortEntry]]:
 
             try:
                 host_port = int(match.group("hport"))  # cspell:disable-line
-                if not (LO_PORT <= host_port <= HI_PORT):
+                if not port_in_ranges(host_port, PORT_RANGES):
                     continue
 
                 container_port = match.group("cport")  # cspell:disable-line
@@ -788,11 +937,12 @@ def draw_header(screen, only_listen: bool, refresh_secs: float, show_docker_only
     mode = "UNIQUE" if unique_mode else "DETAIL"
 
     # Create title line
+    port_summary = get_port_range_summary(PORT_RANGES)
     title = (
-        f"Ports Manager by Adar Bahar v{VERSION} | https://github.com/AdarBahar/ports | TCP {LO_PORT}-{HI_PORT} | "  # cspell:disable-line
+        f"Ports Manager by Adar Bahar v{VERSION} | https://github.com/AdarBahar/ports | TCP {port_summary} | "  # cspell:disable-line
         f"[u] {mode} | [l] LISTEN: {'ON' if only_listen else 'OFF'} | "
         f"[d] Docker: {'ON' if show_docker_only else 'OFF'} | "
-        f"[+/-] {refresh_secs:.1f}s | [?] help | [q] quit"
+        f"[+/-] {refresh_secs:.1f}s | [p] ports | [?] help | [q] quit"
     )
 
     # Draw title with bold formatting
@@ -917,6 +1067,100 @@ def draw_rows_unique(screen, rows: List[Dict[str, Any]], aliases: Dict[str, Dict
         except curses.error:
             pass
 
+def handle_port_configuration(screen) -> bool:
+    """Handle port configuration. Returns True if configuration changed."""
+    global PORT_RANGES
+
+    try:
+        height, width = screen.getmaxyx()  # cspell:disable-line
+    except curses.error:
+        height, width = 24, 80
+
+    screen.clear()
+
+    # Show current configuration
+    current_config = format_port_ranges(PORT_RANGES)
+
+    config_text = [
+        "🔧 PORT CONFIGURATION",
+        "",
+        f"Current ports: {current_config}",
+        "",
+        "SUPPORTED FORMATS:",
+        "  Single port:     3000",
+        "  Port range:      3000-5000",
+        "  Multiple ports:  3000,8080,9000",
+        "  Multiple ranges: 3000-5000,8000-9000",
+        "  Mixed format:    3000,8000-9000,9999",
+        "",
+        "EXAMPLES:",
+        "  3000-9999        (default range)",
+        "  80,443,3000      (web servers + dev)",
+        "  3000-5000,8000   (dev range + specific)",
+        "",
+        "Enter new port configuration:",
+        "(ESC to cancel, ENTER to save)"
+    ]
+
+    # Display configuration text
+    start_y = max(1, (height - len(config_text) - 3) // 2)
+    for i, line in enumerate(config_text):
+        y = start_y + i
+        if y < height - 3:
+            x = max(0, (width - len(line)) // 2)
+            safe_addnstr(screen, y, x, line, width - x)  # cspell:disable-line
+
+    # Input area
+    input_y = start_y + len(config_text) + 1
+    prompt = "Ports: "
+    safe_addnstr(screen, input_y, 2, prompt, width - 4)  # cspell:disable-line
+    screen.refresh()
+
+    # Get user input
+    input_text = get_user_input(screen, input_y, 2 + len(prompt), width - 4 - len(prompt), 100)
+
+    if input_text is None:  # ESC pressed
+        return False
+
+    if not input_text.strip():  # Empty input
+        return False
+
+    # Parse the input
+    try:
+        new_ranges = parse_port_specification(input_text.strip())
+        if not new_ranges:
+            # Show error
+            error_y = input_y + 2
+            error_msg = "❌ Invalid port specification. Press any key to continue..."
+            safe_addnstr(screen, error_y, 2, error_msg, width - 4)  # cspell:disable-line
+            screen.refresh()
+            screen.getch()  # cspell:disable-line
+            return False
+
+        # Update configuration
+        PORT_RANGES.clear()
+        PORT_RANGES.extend(new_ranges)
+        save_port_config(PORT_RANGES)
+
+        # Show success
+        success_y = input_y + 2
+        success_msg = f"✅ Port configuration updated: {format_port_ranges(PORT_RANGES)}"
+        safe_addnstr(screen, success_y, 2, success_msg, width - 4)  # cspell:disable-line
+        success_msg2 = "Press any key to continue..."
+        safe_addnstr(screen, success_y + 1, 2, success_msg2, width - 4)  # cspell:disable-line
+        screen.refresh()
+        screen.getch()  # cspell:disable-line
+        return True
+
+    except Exception:
+        # Show error
+        error_y = input_y + 2
+        error_msg = "❌ Error parsing port specification. Press any key to continue..."
+        safe_addnstr(screen, error_y, 2, error_msg, width - 4)  # cspell:disable-line
+        screen.refresh()
+        screen.getch()  # cspell:disable-line
+        return False
+
 def draw_help(screen) -> None:
     """Display help screen with all available commands and information."""
     screen.clear()
@@ -931,6 +1175,7 @@ def draw_help(screen) -> None:
         "  l       - toggle LISTEN-only filter",
         "  d       - toggle docker-only rows",
         "  + / -   - change refresh speed",
+        "  p       - configure port ranges",
         "  a       - add/edit alias for a row (per-entry)",
         "  x       - delete per-entry alias",
         "  g       - set/edit global per-process alias",
@@ -1076,7 +1321,12 @@ def initialize_curses(screen) -> None:
 
 def main(screen) -> None:
     """Main application loop with debouncing for rapid key presses."""
+    global PORT_RANGES
     initialize_curses(screen)
+
+    # Load port configuration
+    PORT_RANGES.clear()
+    PORT_RANGES.extend(load_port_config())
 
     # Check for updates (non-blocking)
     try:
@@ -1123,7 +1373,7 @@ def main(screen) -> None:
         # Refresh data if needed
         if current_time - last_refresh >= refresh_secs:
             # Get lsof data
-            lsof_lines = run_lsof(only_listen)
+            lsof_lines = run_lsof(only_listen, PORT_RANGES)
             host_entries = parse_lsof(lsof_lines)
 
             # Get Docker data
@@ -1186,6 +1436,10 @@ def main(screen) -> None:
                 # Set/Edit per-process alias
                 handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
                 last_refresh = 0
+            elif key == ord('p'):
+                # Configure port ranges
+                if handle_port_configuration(screen):
+                    last_refresh = 0  # Force refresh with new port configuration
             elif key == ord('?'):
                 draw_help(screen)
                 last_refresh = 0
@@ -1379,7 +1633,7 @@ def main_without_update_check(screen) -> None:
         # Refresh data if needed
         if current_time - last_refresh >= refresh_secs:
             # Get lsof data
-            lsof_lines = run_lsof(only_listen)
+            lsof_lines = run_lsof(only_listen, PORT_RANGES)
             host_entries = parse_lsof(lsof_lines)
 
             # Get Docker data
@@ -1442,6 +1696,10 @@ def main_without_update_check(screen) -> None:
                 # Set/Edit per-process alias
                 handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
                 last_refresh = 0
+            elif key == ord('p'):
+                # Configure port ranges
+                if handle_port_configuration(screen):
+                    last_refresh = 0  # Force refresh with new port configuration
             elif key == ord('?'):
                 draw_help(screen)
                 last_refresh = 0
@@ -1458,12 +1716,19 @@ if __name__ == "__main__":
             print("Ports Manager - Monitor network ports and processes")
             print(f"Version: {VERSION}")
             print()
-            print("Usage: ports [options]")
+            print("Usage: ports [options] [--ports PORT_SPEC]")
             print()
             print("Options:")
             print("  -h, --help       Show this help message")
             print("  -v, --version    Show version information")
             print("  --no-update      Skip automatic update check")
+            print("  --ports SPEC     Set port ranges (e.g., '3000-5000,8080')")
+            print()
+            print("Port Specification Examples:")
+            print("  --ports 3000           Single port")
+            print("  --ports 3000-5000      Port range")
+            print("  --ports 3000,8080      Multiple ports")
+            print("  --ports 3000-5000,8080 Mixed format")
             print()
             print("Controls:")
             print("  q       - quit")
@@ -1471,12 +1736,36 @@ if __name__ == "__main__":
             print("  l       - toggle LISTEN-only filter")
             print("  d       - toggle docker-only rows")
             print("  + / -   - change refresh speed")
+            print("  p       - configure port ranges")
             print("  a       - add/edit alias")
             print("  x       - delete alias")
             print("  g       - set process alias")
             print("  ?       - show help")
             print("  ESC     - cancel current operation")
             sys.exit(0)
+
+        # Handle --ports argument
+        if "--ports" in sys.argv:
+            try:
+                ports_index = sys.argv.index("--ports")
+                if ports_index + 1 < len(sys.argv):
+                    port_spec = sys.argv[ports_index + 1]
+                    new_ranges = parse_port_specification(port_spec)
+                    if new_ranges:
+                        PORT_RANGES.clear()
+                        PORT_RANGES.extend(new_ranges)
+                        save_port_config(PORT_RANGES)
+                        print(f"Port configuration set to: {format_port_ranges(PORT_RANGES)}")
+                    else:
+                        print(f"Error: Invalid port specification '{port_spec}'")
+                        print("Examples: 3000, 3000-5000, 3000,8080, 3000-5000,8080")
+                        sys.exit(1)
+                else:
+                    print("Error: --ports requires a port specification")
+                    sys.exit(1)
+            except ValueError:
+                print("Error: Invalid --ports argument")
+                sys.exit(1)
 
         check_dependencies()
         curses.wrapper(main_with_update_check)
