@@ -1,0 +1,49 @@
+# Ports Manager - Requirements File
+# 
+# This project uses ZERO external dependencies for runtime.
+# All functionality is built using Python's standard library only.
+# 
+# The following are optional development dependencies that can be installed
+# for development, testing, and code quality purposes.
+# 
+# To install development dependencies:
+# pip install -r requirements.txt
+# 
+# Or install only what you need:
+# pip install black flake8 mypy pytest
+
+# Code formatting
+black>=23.0.0
+
+# Code linting
+flake8>=6.0.0
+
+# Type checking
+mypy>=1.0.0
+
+# Testing framework
+pytest>=7.0.0
+
+# Additional development tools (optional)
+# Uncomment if needed for development:
+
+# pytest-cov>=4.0.0          # Test coverage
+# pytest-mock>=3.10.0        # Mocking for tests
+# pre-commit>=3.0.0          # Git hooks for code quality
+# isort>=5.12.0              # Import sorting
+# bandit>=1.7.0              # Security linting
+# pylint>=2.17.0             # Additional linting
+# autopep8>=2.0.0            # Code formatting alternative
+# pydocstyle>=6.3.0          # Docstring style checking
+
+# Note: This project is designed to work with Python 3.8+ standard library only.
+# No runtime dependencies are required for the ports manager to function.
+# 
+# System dependencies (must be installed separately):
+# - lsof (command-line tool)
+# - docker (optional, for container integration)
+# 
+# Installation commands for system dependencies:
+# macOS: brew install lsof
+# Ubuntu/Debian: sudo apt install lsof
+# CentOS/RHEL/Fedora: sudo yum install lsof (or dnf)
