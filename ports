@@ -572,7 +572,8 @@ def show_message(screen, message: str, wait_for_key: bool = True) -> None:
 
 def get_user_input(screen, prompt: str) -> str:
     """Get user input from the bottom line of the screen with ESC support."""
-    curses.echo()
+    # Turn OFF echo to prevent double characters
+    curses.noecho()  # cspell:disable-line
     try:
         # Handle potential terminal resize during input
         try:
@@ -604,24 +605,28 @@ def get_user_input(screen, prompt: str) -> str:
 
                 if key == 27:  # ESC key
                     return ""  # Return empty string to indicate cancellation
-                elif key == ord('\n') or key == ord('\r') or key == curses.KEY_ENTER:
+                elif key == ord('\n') or key == ord('\r') or key == 10:
                     break  # Enter pressed, return current input
                 elif key == curses.KEY_BACKSPACE or key == 127 or key == 8:
-                    # Backspace
+                    # Backspace - remove character from input and screen
                     if input_text:
                         input_text = input_text[:-1]
                         cursor_pos -= 1
                         try:
+                            # Move cursor back and clear the character
                             screen.move(input_line, cursor_pos)
-                            screen.delch()  # cspell:disable-line
+                            screen.addch(ord(' '))  # Replace with space  # cspell:disable-line
+                            screen.move(input_line, cursor_pos)  # Move cursor back
+                            screen.refresh()
                         except curses.error:
                             pass
                 elif 32 <= key <= 126:  # Printable ASCII characters
                     if len(input_text) < 100:  # Reasonable limit
                         input_text += chr(key)
-                        cursor_pos += 1
                         try:
                             screen.addch(key)  # cspell:disable-line
+                            screen.refresh()
+                            cursor_pos += 1
                         except curses.error:
                             pass
 
@@ -630,7 +635,8 @@ def get_user_input(screen, prompt: str) -> str:
 
         return input_text.strip()
     finally:
-        curses.noecho()  # cspell:disable-line
+        # Keep echo OFF since we're handling it manually
+        pass
 
 def draw_header(screen, only_listen: bool, refresh_secs: float, show_docker_only: bool, unique_mode: bool) -> None:
     """Draw the application header with title and column headers."""
