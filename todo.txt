@@ -1,4 +1,0 @@
-todo
-update app (from repo)
-check if there are updates in repo (version number)
-configure ports range (range, individual ports)
