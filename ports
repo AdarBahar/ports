@@ -1,424 +1,1019 @@
 #!/usr/bin/env python3
+"""
+Ports Manager - A terminal-based tool for monitoring network ports and processes.
+Optimized version with improved performance and code structure.
+"""
 import curses
+import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import time
-from collections import defaultdict
 
-# Config
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Optional, Any, Tuple
+
+# =========================
+# Configuration
+# =========================
 LO_PORT, HI_PORT = 3000, 9999
 REFRESH_SECS_DEFAULT = 2.0
+ALIASES_PATH = os.path.expanduser("~/.ports_aliases.json")
 
+# Regex patterns (compiled once for performance)
 LSOF_FIELDS = ["COMMAND", "PID", "USER", "FD", "TYPE", "DEVICE", "SIZE/OFF", "NODE", "NAME"]
 NAME_RE = re.compile(r"^(?P<local>\S+?)(?:->(?P<remote>\S+))?(?: \((?P<state>[A-Z]+)\))?$")
+PORT_MAP_RE = re.compile(
+    r"(?:(?P<hostip>\*|[\[\]0-9a-fA-F:\.]+):)?(?P<hport>\d+)\s*->\s*(?P<cport>\d+(?:-\d+)?)/(?P<proto>\w+)"  # cspell:disable-line
+)
 DOCKER_PS_FMT = "{{.ID}} {{.Names}} {{.Image}} {{.Ports}}"
 
-def run(cmd: str):
+# Built-in friendly names for common processes
+BUILTIN_FRIENDLY = {
+    "httpd": "Web server",
+    "apache2": "Web server",
+    "nginx": "Web server",
+    "caddy": "Web server",
+    "node": "Node.js",
+    "nodejs": "Node.js",
+    "python": "Python app",
+    "gunicorn": "Gunicorn",
+    "uvicorn": "Uvicorn",
+    "php-fpm": "PHP-FPM",
+    "mysqld": "MySQL",  # cspell:disable-line
+    "mysql": "MySQL",
+    "postgres": "PostgreSQL",
+    "postgresql": "PostgreSQL",
+    "redis-server": "Redis",
+    "mongod": "MongoDB",
+    "java": "Java app",
+    "docker-proxy": "Docker published port",
+    "kafka": "Kafka",
+    "zookeeper": "ZooKeeper",
+    "ssh": "SSH server",
+}
+
+# =========================
+# Data Classes
+# =========================
+@dataclass
+class PortEntry:
+    """Represents a single port entry with all its attributes."""
+    proc: str = ""
+    pid: str = ""
+    user: str = ""
+    port: int = 0
+    state: str = ""
+    local: str = ""
+    remote: str = ""
+    container: str = ""
+    image: str = ""
+    cport: str = ""  # cspell:disable-line
+    source: str = "host"
+
+@dataclass
+class AggregatedPort:
+    """Represents aggregated data for a port in unique mode."""
+    port: int
+    states: Set[str] = field(default_factory=set)
+    procs: List[str] = field(default_factory=list)  # cspell:disable-line
+    containers: List[str] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    locals: Set[str] = field(default_factory=set)
+    remotes: Set[str] = field(default_factory=set)
+    cports: Set[str] = field(default_factory=set)  # cspell:disable-line
+    has_host_listener: bool = False
+    has_docker: bool = False
+
+# =========================
+# Utility Functions
+# =========================
+def run_command(cmd: str) -> str:
+    """Execute a shell command and return output, or empty string on error."""
     try:
-        return subprocess.check_output(shlex.split(cmd), stderr=subprocess.DEVNULL, text=True)
-    except Exception:
+        return subprocess.check_output(
+            shlex.split(cmd),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10  # Prevent hanging
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return ""
 
-# ---------- lsof ----------
-def run_lsof(only_listen: bool):
+def _default_aliases() -> Dict[str, Dict[str, str]]:
+    """Return default alias structure."""
+    return {"per_entry": {}, "per_proc": {}}
+
+def ensure_alias_file_exists() -> Dict[str, Dict[str, str]]:
+    """
+    Ensure ~/.ports_aliases.json exists and is valid.
+    Creates or repairs the file if needed. Never raises exceptions.
+    """
+    data: Optional[Dict[str, Any]] = None
+
+    if os.path.exists(ALIASES_PATH):
+        try:
+            with open(ALIASES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            # Corrupt file - backup and recreate
+            try:
+                os.replace(ALIASES_PATH, f"{ALIASES_PATH}.bak")
+            except OSError:
+                pass
+            data = None
+
+    if not isinstance(data, dict):
+        data = _default_aliases()
+
+    # Ensure required keys exist
+    for key in ["per_entry", "per_proc"]:
+        if key not in data or not isinstance(data[key], dict):
+            data[key] = {}
+
+    # Write normalized file
+    try:
+        with open(ALIASES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+    return data
+
+def load_aliases() -> Dict[str, Dict[str, str]]:
+    """Load aliases from file."""
+    return ensure_alias_file_exists()
+
+def save_aliases(aliases: Dict[str, Dict[str, str]]) -> None:
+    """Save aliases to file with validation."""
+    # Validate structure
+    for key in ["per_entry", "per_proc"]:
+        if key not in aliases or not isinstance(aliases[key], dict):
+            aliases[key] = {}
+
+    try:
+        with open(ALIASES_PATH, "w", encoding="utf-8") as f:
+            json.dump(aliases, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+def per_entry_key_detail(entry: PortEntry) -> str:
+    """Generate key for per-entry alias in detail mode."""
+    return f"detail:{entry.proc}|{entry.pid}|{entry.port}"
+
+def per_entry_key_unique(port: int) -> str:
+    """Generate key for per-entry alias in unique mode."""
+    return f"unique:{port}"
+
+def resolve_alias(entry: PortEntry, unique_mode: bool, aliases: Dict[str, Dict[str, str]]) -> str:
+    """
+    Resolve alias for a port entry with priority:
+    1) Per-entry alias (mode-specific)
+    2) Per-process alias (user-defined)
+    3) Built-in friendly name
+    """
+    # Check per-entry aliases first
+    if unique_mode:
+        key = per_entry_key_unique(entry.port)
+    else:
+        key = per_entry_key_detail(entry)
+
+    if key in aliases["per_entry"]:
+        return aliases["per_entry"][key]
+
+    # Check per-process aliases
+    proc = entry.proc.strip()
+    if proc and proc in aliases["per_proc"]:
+        return aliases["per_proc"][proc]
+
+    # Check built-in friendly names
+    if proc and proc in BUILTIN_FRIENDLY:
+        return BUILTIN_FRIENDLY[proc]
+
+    return ""
+
+def resolve_alias_for_unique_row(row: Dict[str, Any], aliases: Dict[str, Dict[str, str]]) -> str:
+    """Resolve alias for aggregated unique mode row."""
+    # Check per-entry alias for this port
+    port = row.get("port", 0)
+    key = per_entry_key_unique(port)
+    if key in aliases["per_entry"]:
+        return aliases["per_entry"][key]
+
+    # Try to get process name from summary
+    proc_summary = row.get("proc_summary", "")
+    if proc_summary:
+        first_proc = proc_summary.split(",")[0].strip()
+        if first_proc in aliases["per_proc"]:
+            return aliases["per_proc"][first_proc]
+        if first_proc in BUILTIN_FRIENDLY:
+            return BUILTIN_FRIENDLY[first_proc]
+
+    return ""
+
+# =========================
+# lsof Processing
+# =========================
+def run_lsof(only_listen: bool) -> List[str]:
+    """Run lsof command and return output lines."""
     cmd = f"lsof -nP -iTCP:{LO_PORT}-{HI_PORT}"
     if only_listen:
         cmd += " -sTCP:LISTEN"
-    out = run(cmd)
-    return out.splitlines() if out else []
+    output = run_command(cmd)
+    return output.splitlines() if output else []
 
-def parse_lsof(lines):
+def extract_port_from_address(address: str) -> Optional[int]:
+    """Extract port number from address string (handles IPv4 and IPv6)."""
+    try:
+        if address.startswith('['):  # IPv6 like [::1]:5173
+            return int(address.rsplit(':', 1)[1])
+        elif ':' in address:  # IPv4 like 127.0.0.1:5173
+            return int(address.rsplit(':', 1)[1])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+def parse_lsof(lines: List[str]) -> List[PortEntry]:
+    """Parse lsof output into PortEntry objects."""
+    # Find header line
     header_idx = None
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("COMMAND") and "NAME" in ln:
+    for i, line in enumerate(lines):
+        if line.strip().startswith("COMMAND") and "NAME" in line:
             header_idx = i
             break
+
     if header_idx is None:
         return []
 
     entries = []
-    for ln in lines[header_idx + 1:]:
-        if not ln.strip():
+    for line in lines[header_idx + 1:]:
+        line = line.strip()
+        if not line:
             continue
-        parts = ln.split(None, len(LSOF_FIELDS) - 1)
+
+        # Split into fields (last field may contain spaces)
+        parts = line.split(None, len(LSOF_FIELDS) - 1)
         if len(parts) < len(LSOF_FIELDS):
             continue
+
         row = dict(zip(LSOF_FIELDS, parts))
-        m = NAME_RE.match(row["NAME"])
-        if not m:
+
+        # Parse the NAME field
+        match = NAME_RE.match(row["NAME"])
+        if not match:
             continue
-        local = m.group("local") or ""
-        remote = m.group("remote") or ""
-        state = m.group("state") or ""
-        # Extract port from local
-        port = None
-        if local.startswith('['):  # IPv6 like [::1]:5173
-            try:
-                port = int(local.rsplit(':', 1)[1])
-            except Exception:
-                port = None
-        else:
-            if ':' in local:
-                try:
-                    port = int(local.rsplit(':', 1)[1])
-                except Exception:
-                    port = None
+
+        local = match.group("local") or ""
+        remote = match.group("remote") or ""
+        state = match.group("state") or ""
+
+        # Extract port number
+        port = extract_port_from_address(local)
         if port is None:
             continue
 
-        entries.append({
-            "proc": row["COMMAND"],
-            "pid": row["PID"],
-            "user": row["USER"],
-            "port": port,
-            "state": state,
-            "local": local,
-            "remote": remote,
-            "container": "",
-            "image": "",
-            "cport": "",
-            "source": "host",
-        })
+        entry = PortEntry(
+            proc=row["COMMAND"],
+            pid=row["PID"],
+            user=row["USER"],
+            port=port,
+            state=state,
+            local=local,
+            remote=remote,
+            source="host"
+        )
+        entries.append(entry)
 
-    entries.sort(key=lambda e: (e["port"], int(e["pid"]) if e["pid"].isdigit() else 0))
+    # Sort by port, then by PID
+    entries.sort(key=lambda e: (e.port, int(e.pid) if e.pid.isdigit() else 0))
     return entries
 
-# ---------- docker ----------
-PORT_MAP_RE = re.compile(
-    r"(?:(?P<hostip>\*|[\[\]0-9a-fA-F:\.]+):)?(?P<hport>\d+)"
-    r"\s*->\s*(?P<cport>\d+(?:-\d+)?)/(?P<proto>\w+)"
-)
+# =========================
+# Docker Processing
+# =========================
+@dataclass
+class DockerInfo:
+    """Docker container port mapping information."""
+    container: str
+    image: str
+    cport: str  # cspell:disable-line
+    proto: str
+    container_id: str
 
-def docker_port_map():
+def docker_port_map() -> Tuple[Dict[int, List[DockerInfo]], List[PortEntry]]:
+    """
+    Get Docker port mappings and return host port map and docker-only entries.
+    Returns: (host_port_map, docker_only_entries)
+    """
     if not shutil.which("docker"):
         return {}, []
 
-    out = run(f"docker ps --format '{DOCKER_PS_FMT}'")
-    host_map = {}
-    docker_rows = []
-    if not out:
-        return host_map, docker_rows
+    output = run_command(f"docker ps --format '{DOCKER_PS_FMT}'")
+    if not output:
+        return {}, []
 
-    for line in out.splitlines():
+    host_map: Dict[int, List[DockerInfo]] = {}
+    docker_entries: List[PortEntry] = []
+
+    for line in output.splitlines():
         parts = line.split(" ", 3)
         if len(parts) < 4:
             continue
-        cid, name, image, ports_str = parts[0], parts[1], parts[2], parts[3]
+
+        container_id, name, image, ports_str = parts
         if not ports_str:
             continue
-        for seg in ports_str.split(","):
-            seg = seg.strip()
-            m = PORT_MAP_RE.search(seg)
-            if not m:
-                continue
-            hport = int(m.group("hport"))
-            if not (LO_PORT <= hport <= HI_PORT):
-                continue
-            cport = m.group("cport")
-            proto = m.group("proto")
-            info = {"container": name, "image": image, "cport": cport, "proto": proto, "id": cid}
-            host_map.setdefault(hport, []).append(info)
-            docker_rows.append({
-                "proc": "docker-proxy",
-                "pid": "",
-                "user": "",
-                "port": hport,
-                "state": "PUBLISHED",
-                "local": f"0.0.0.0:{hport}",
-                "remote": "",
-                "container": name,
-                "image": image,
-                "cport": f"{cport}/{proto}",
-                "source": "docker",
-            })
-    docker_rows.sort(key=lambda e: (e["port"], e["container"]))
-    return host_map, docker_rows
 
-# ---------- merge and aggregate ----------
-def merge_rows(host_rows, docker_host_map, docker_only_rows, show_docker_only):
-    merged = []
-    for r in host_rows:
-        hport = r["port"]
-        infos = docker_host_map.get(hport, [])
-        if infos:
-            for info in infos:
-                r2 = dict(r)
-                r2["container"] = info["container"]
-                r2["image"] = info["image"]
-                r2["cport"] = f"{info['cport']}/{info.get('proto','')}".rstrip('/')
-                merged.append(r2)
+        # Parse port mappings
+        for segment in ports_str.split(","):
+            segment = segment.strip()
+            match = PORT_MAP_RE.search(segment)
+            if not match:
+                continue
+
+            try:
+                host_port = int(match.group("hport"))  # cspell:disable-line
+                if not (LO_PORT <= host_port <= HI_PORT):
+                    continue
+
+                container_port = match.group("cport")  # cspell:disable-line
+                protocol = match.group("proto")
+
+                # Create Docker info
+                docker_info = DockerInfo(
+                    container=name,
+                    image=image,
+                    cport=container_port,  # cspell:disable-line
+                    proto=protocol,
+                    container_id=container_id
+                )
+
+                # Add to host map
+                host_map.setdefault(host_port, []).append(docker_info)
+
+                # Create docker entry
+                docker_entry = PortEntry(
+                    proc="docker-proxy",
+                    port=host_port,
+                    state="PUBLISHED",
+                    local=f"0.0.0.0:{host_port}",
+                    container=name,
+                    image=image,
+                    cport=f"{container_port}/{protocol}",  # cspell:disable-line
+                    source="docker"
+                )
+                docker_entries.append(docker_entry)
+
+            except (ValueError, KeyError):
+                continue
+
+    # Sort docker entries
+    docker_entries.sort(key=lambda e: (e.port, e.container))
+    return host_map, docker_entries
+
+# =========================
+# Data Merging and Aggregation
+# =========================
+def merge_rows(
+    host_entries: List[PortEntry],
+    docker_host_map: Dict[int, List[DockerInfo]],
+    docker_only_entries: List[PortEntry],
+    show_docker_only: bool
+) -> List[PortEntry]:
+    """Merge host entries with Docker information."""
+    merged: List[PortEntry] = []
+
+    # Merge host entries with Docker info
+    for entry in host_entries:
+        docker_infos = docker_host_map.get(entry.port, [])
+        if docker_infos:
+            # Create separate entries for each Docker mapping
+            for docker_info in docker_infos:
+                merged_entry = PortEntry(
+                    proc=entry.proc,
+                    pid=entry.pid,
+                    user=entry.user,
+                    port=entry.port,
+                    state=entry.state,
+                    local=entry.local,
+                    remote=entry.remote,
+                    container=docker_info.container,
+                    image=docker_info.image,
+                    cport=f"{docker_info.cport}/{docker_info.proto}",  # cspell:disable-line
+                    source=entry.source
+                )
+                merged.append(merged_entry)
         else:
-            merged.append(r)
+            merged.append(entry)
+
+    # Add Docker-only entries if requested
     if show_docker_only:
-        host_ports_present = {r["port"] for r in merged}
-        for drow in docker_only_rows:
-            if drow["port"] not in host_ports_present:
-                merged.append(drow)
-    merged.sort(key=lambda e: (e["port"], e.get("container",""), e.get("proc","")))
+        host_ports = {entry.port for entry in merged}
+        for docker_entry in docker_only_entries:
+            if docker_entry.port not in host_ports:
+                merged.append(docker_entry)
+
+    # Sort by port, container, then process
+    merged.sort(key=lambda e: (e.port, e.container, e.proc))
     return merged
 
-def aggregate_unique_ports(rows):
-    by_port = defaultdict(lambda: {
-        "port": None,
-        "states": set(),
-        "procs": [],
-        "containers": [],
-        "images": [],
-        "locals": set(),
-        "remotes": set(),
-        "cports": set(),
-        "has_host_listener": False,
-        "has_docker": False,
-    })
+def unique_keep_order(sequence: List[str]) -> List[str]:
+    """Remove duplicates while preserving order."""
+    seen: Set[str] = set()
+    result = []
+    for item in sequence:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
-    for r in rows:
-        p = r["port"]
-        agg = by_port[p]
-        agg["port"] = p
-        if r.get("state"): agg["states"].add(r["state"])
-        if r.get("proc"): agg["procs"].append(r["proc"])
-        if r.get("container"): agg["containers"].append(r["container"])
-        if r.get("image"): agg["images"].append(r["image"])
-        if r.get("local"): agg["locals"].add(r["local"])
-        if r.get("remote"): agg["remotes"].add(r["remote"])
-        if r.get("cport"): agg["cports"].add(r["cport"])
-        if r.get("source") == "host": agg["has_host_listener"] = True
-        if r.get("source") == "docker": agg["has_docker"] = True
+def summarize_list(items: List[str], max_items: int = 3) -> str:
+    """Summarize a list with truncation if too long."""
+    if not items:
+        return ""
+    if len(items) <= max_items:
+        return ", ".join(items)
+    return ", ".join(items[:max_items]) + f" +{len(items) - max_items} more"
 
-    def uniq_keep_order(seq):
-        seen = set()
-        out = []
-        for x in seq:
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
+def aggregate_unique_ports(entries: List[PortEntry]) -> List[Dict[str, Any]]:
+    """Aggregate port entries by port number for unique mode display."""
+    by_port: Dict[int, AggregatedPort] = {}
 
-    out_rows = []
-    for p, agg in by_port.items():
-        procs = uniq_keep_order(agg["procs"])
-        containers = uniq_keep_order(agg["containers"])
-        images = uniq_keep_order(agg["images"])
+    for entry in entries:
+        if entry.port not in by_port:
+            by_port[entry.port] = AggregatedPort(port=entry.port)
 
-        state = "LISTEN" if "LISTEN" in agg["states"] else (
-            "PUBLISHED" if "PUBLISHED" in agg["states"] else (
-                "ESTABLISHED" if "ESTABLISHED" in agg["states"] else ",".join(sorted(agg["states"])) or ""
-            )
-        )
+        agg = by_port[entry.port]
 
-        def summarize(lst, cap=3):
-            if not lst:
-                return ""
-            if len(lst) <= cap:
-                return ", ".join(lst)
-            return ", ".join(lst[:cap]) + f" +{len(lst)-cap} more"
+        # Aggregate data
+        if entry.state:
+            agg.states.add(entry.state)
+        if entry.proc:
+            agg.procs.append(entry.proc)  # cspell:disable-line
+        if entry.container:
+            agg.containers.append(entry.container)
+        if entry.image:
+            agg.images.append(entry.image)
+        if entry.local:
+            agg.locals.add(entry.local)
+        if entry.remote:
+            agg.remotes.add(entry.remote)
+        if entry.cport:  # cspell:disable-line
+            agg.cports.add(entry.cport)  # cspell:disable-line
 
-        local_hint = next(iter(agg["locals"]), f"*:{p}")
-        cports_hint = summarize(sorted(agg["cports"])) if agg["cports"] else ""
-        note = f"{local_hint}"
-        if cports_hint:
-            note += f"  [{cports_hint}]"
+        # Track source types
+        if entry.source == "host":
+            agg.has_host_listener = True
+        elif entry.source == "docker":
+            agg.has_docker = True
 
-        out_rows.append({
-            "port": p,
+    # Convert to output format
+    result = []
+    for port_num, agg in by_port.items():
+        # Determine primary state
+        if "LISTEN" in agg.states:
+            state = "LISTEN"
+        elif "PUBLISHED" in agg.states:
+            state = "PUBLISHED"
+        elif "ESTABLISHED" in agg.states:
+            state = "ESTABLISHED"
+        else:
+            state = ",".join(sorted(agg.states)) if agg.states else ""
+
+        # Create summaries
+        procs_unique = unique_keep_order(agg.procs)  # cspell:disable-line
+        containers_unique = unique_keep_order(agg.containers)
+        images_unique = unique_keep_order(agg.images)
+
+        # Create note with local address and container ports
+        local_hint = next(iter(agg.locals), f"*:{port_num}")
+        cports_hint = summarize_list(sorted(agg.cports)) if agg.cports else ""  # cspell:disable-line
+        note = local_hint
+        if cports_hint:  # cspell:disable-line
+            note += f"  [{cports_hint}]"  # cspell:disable-line
+
+        # Determine source
+        if agg.has_host_listener and agg.has_docker:
+            source = "mixed"
+        elif agg.has_docker:
+            source = "docker"
+        else:
+            source = "host"
+
+        result.append({
+            "port": port_num,
             "state": state,
-            "proc_summary": summarize(procs),
-            "container_summary": summarize(containers),
-            "image_summary": summarize(images),
+            "proc_summary": summarize_list(procs_unique),  # cspell:disable-line
+            "container_summary": summarize_list(containers_unique),
+            "image_summary": summarize_list(images_unique),
             "note": note,
-            "source": "mixed" if (agg["has_host_listener"] and agg["has_docker"]) else (
-                "docker" if agg["has_docker"] else "host"
-            ),
+            "source": source,
         })
 
-    out_rows.sort(key=lambda r: r["port"])
-    return out_rows
+    result.sort(key=lambda r: r["port"])
+    return result
 
-# ---------- UI helpers ----------
-def safe_addnstr(stdscr, y, x, s, maxw):
-    h, w = stdscr.getmaxyx()
-    if y < 0 or y >= h or x < 0 or x >= w:
-        return
-    width = max(0, min(maxw, w - x))
-    if width <= 0:
-        return
-    stdscr.addnstr(y, x, s[:width], width)
+# =========================
+# UI Helper Functions
+# =========================
+def safe_addnstr(screen, y: int, x: int, text: str, max_width: int) -> None:  # cspell:disable-line
+    """Safely add string to screen with bounds checking."""
+    try:
+        height, width = screen.getmaxyx()  # cspell:disable-line
+        if y < 0 or y >= height or x < 0 or x >= width:
+            return
 
-def draw_header(stdscr, only_listen, refresh_secs, show_docker_only, unique_mode):
-    h, w = stdscr.getmaxyx()
-    mode = "UNIQUE" if unique_mode else "DETAIL"
-    title = (
-        f"Ports managment by Adar Bahar | "
-        f" TCP {LO_PORT}-{HI_PORT}  "
-        f"[u] mode: {mode}  "
-        f"[l] only LISTEN: {'ON' if only_listen else 'OFF'}  "
-        f"[d] show docker-only: {'ON' if show_docker_only else 'OFF'}  "
-        f"[+/ -] refresh: {refresh_secs:.1f}s  [q] quit"
-    )
-    stdscr.attron(curses.A_BOLD)
-    safe_addnstr(stdscr, 0, 0, title.ljust(w), w)
-    stdscr.attroff(curses.A_BOLD)
-    if h >= 2:
+        available_width = max(0, min(max_width, width - x))
+        if available_width <= 0:
+            return
+
+        screen.addnstr(y, x, text[:available_width], available_width)  # cspell:disable-line
+    except curses.error:
+        # Ignore curses errors (e.g., writing to bottom-right corner)
+        pass
+
+def get_user_input(screen, prompt: str) -> str:
+    """Get user input from the bottom line of the screen."""
+    curses.echo()
+    try:
+        height, width = screen.getmaxyx()  # cspell:disable-line
+        input_line = height - 1
+
+        # Clear the line and show prompt
+        screen.move(input_line, 0)
+        screen.clrtoeol()  # cspell:disable-line
+        safe_addnstr(screen, input_line, 0, prompt, width - 1)  # cspell:disable-line
+        screen.refresh()
+
+        # Get user input
         try:
-            stdscr.hline(1, 0, curses.ACS_HLINE, max(0, w))
+            user_bytes = screen.getstr(input_line, len(prompt), 256)  # cspell:disable-line
+            return user_bytes.decode("utf-8").strip()
+        except (UnicodeDecodeError, curses.error):
+            return ""
+    finally:
+        curses.noecho()  # cspell:disable-line
+
+def draw_header(screen, only_listen: bool, refresh_secs: float, show_docker_only: bool, unique_mode: bool) -> None:
+    """Draw the application header with title and column headers."""
+    height, width = screen.getmaxyx()  # cspell:disable-line
+    mode = "UNIQUE" if unique_mode else "DETAIL"
+
+    # Create title line
+    title = (
+        f"Ports Manager | TCP {LO_PORT}-{HI_PORT} | "
+        f"[u] {mode} | [l] LISTEN: {'ON' if only_listen else 'OFF'} | "
+        f"[d] Docker: {'ON' if show_docker_only else 'OFF'} | "
+        f"[+/-] {refresh_secs:.1f}s | [a] alias | [x] del | [g] proc | [?] help | [q] quit"
+    )
+
+    # Draw title with bold formatting
+    try:
+        screen.attron(curses.A_BOLD)  # cspell:disable-line
+        safe_addnstr(screen, 0, 0, title.ljust(width), width)  # cspell:disable-line
+        screen.attroff(curses.A_BOLD)  # cspell:disable-line
+    except curses.error:
+        pass
+
+    # Draw horizontal line
+    if height >= 2:
+        try:
+            screen.hline(1, 0, curses.ACS_HLINE, width)  # cspell:disable-line
         except curses.error:
             pass
 
+    # Draw column headers
     if unique_mode:
-        header = f"{'PORT':>6}  {'STATE':<12} {'PROCESSES':<28} {'CONTAINERS':<24} {'IMAGES':<24} {'LOCAL / CONTAINER PORTS'}"
+        header = (
+            f"{'#':>3} {'PORT':>6}  {'STATE':<12} {'PROCESSES':<28} "
+            f"{'CONTAINERS':<24} {'IMAGES':<24} {'ALIAS':<18} {'LOCAL / CONTAINER PORTS'}"
+        )
     else:
         header = (
-            f"{'PORT':>6}  {'STATE':<12} {'PID':>7}  {'USER':<10} "
-            f"{'PROCESS':<16} {'CONTAINER':<18} {'IMAGE':<18} {'LOCAL → REMOTE / CONTAINER PORT'}"
+            f"{'#':>3} {'PORT':>6}  {'STATE':<12} {'PID':>7}  {'USER':<10} "
+            f"{'PROCESS':<16} {'CONTAINER':<18} {'IMAGE':<18} {'ALIAS':<18} "
+            f"{'LOCAL → REMOTE / CONTAINER PORT'}"
         )
-    safe_addnstr(stdscr, 2, 0, header.ljust(w), w)
-    if h >= 4:
+
+    safe_addnstr(screen, 2, 0, header.ljust(width), width)  # cspell:disable-line
+
+    # Draw second horizontal line
+    if height >= 4:
         try:
-            stdscr.hline(3, 0, curses.ACS_HLINE, max(0, w))
+            screen.hline(3, 0, curses.ACS_HLINE, width)  # cspell:disable-line
         except curses.error:
             pass
 
-def draw_rows_detail(stdscr, rows, start_line=4):
-    h, w = stdscr.getmaxyx()
-    if h <= start_line + 1:
+def get_state_color_pair(state: str) -> int:
+    """Get color pair number for connection state."""
+    if state in ("LISTEN", "PUBLISHED"):
+        return 2  # Green
+    elif state == "ESTABLISHED":
+        return 3  # Cyan
+    else:
+        return 1  # Default
+
+def draw_rows_detail(screen, entries: List[PortEntry], aliases: Dict[str, Dict[str, str]], start_line: int = 4) -> None:
+    """Draw port entries in detail mode."""
+    height, width = screen.getmaxyx()  # cspell:disable-line
+    if height <= start_line + 1:
         return
-    max_rows = max(0, h - start_line - 2)
+
+    max_rows = max(0, height - start_line - 2)
+
     for i in range(max_rows):
         y = start_line + i
-        if i >= len(rows):
-            safe_addnstr(stdscr, y, 0, " " * (w - 1), w - 1)
+
+        # Clear line if no more entries
+        if i >= len(entries):
+            safe_addnstr(screen, y, 0, " " * (width - 1), width - 1)  # cspell:disable-line
             continue
-        r = rows[i]
-        state = r.get("state", "") or ""
-        left = (
-            f"{r['port']:>6}  {state:<12} {r.get('pid',''):>7}  {r.get('user',''):<10} "
-            f"{r.get('proc',''):<16} {r.get('container',''):<18} {r.get('image',''):<18} "
+
+        entry = entries[i]
+        alias = resolve_alias(entry, unique_mode=False, aliases=aliases)
+
+        # Format the row
+        left_part = (
+            f"{i+1:>3} {entry.port:>6}  {entry.state:<12} {entry.pid:>7}  {entry.user:<10} "
+            f"{entry.proc:<16} {entry.container:<18} {entry.image:<18} {alias:<18} "
         )
-        right = r['local']
-        if r.get("remote"):
-            right += f" → {r['remote']}"
-        if r.get("cport"):
-            right += f"   [{r['cport']}]"
 
-        if state in ("LISTEN", "PUBLISHED"):
-            stdscr.attron(curses.color_pair(2))
-        elif state == "ESTABLISHED":
-            stdscr.attron(curses.color_pair(3))
-        else:
-            stdscr.attron(curses.color_pair(1))
+        right_part = entry.local
+        if entry.remote:
+            right_part += f" → {entry.remote}"
+        if entry.cport:  # cspell:disable-line
+            right_part += f"   [{entry.cport}]"  # cspell:disable-line
 
-        safe_addnstr(stdscr, y, 0, left + right, w - 1)
-
-        stdscr.attroff(curses.color_pair(1))
-        stdscr.attroff(curses.color_pair(2))
-        stdscr.attroff(curses.color_pair(3))
-
-def draw_rows_unique(stdscr, rows, start_line=4):
-    h, w = stdscr.getmaxyx()
-    if h <= start_line + 1:
-        return
-    max_rows = max(0, h - start_line - 2)
-    for i in range(max_rows):
-        y = start_line + i
-        if i >= len(rows):
-            safe_addnstr(stdscr, y, 0, " " * (w - 1), w - 1)
-            continue
-        r = rows[i]
-        state = r.get("state", "") or ""
-        left = (
-            f"{r['port']:>6}  {state:<12} {r.get('proc_summary',''):<28} "
-            f"{r.get('container_summary',''):<24} {r.get('image_summary',''):<24} "
-        )
-        right = r.get("note","")
-
-        if state in ("LISTEN", "PUBLISHED"):
-            stdscr.attron(curses.color_pair(2))
-        elif state == "ESTABLISHED":
-            stdscr.attron(curses.color_pair(3))
-        else:
-            stdscr.attron(curses.color_pair(1))
-
-        safe_addnstr(stdscr, y, 0, left + right, w - 1)
-
-        stdscr.attroff(curses.color_pair(1))
-        stdscr.attroff(curses.color_pair(2))
-        stdscr.attroff(curses.color_pair(3))
-
-def draw_footer(stdscr):
-    h, w = stdscr.getmaxyx()
-    if h >= 6:
+        # Apply color based on state
+        color_pair = get_state_color_pair(entry.state)
         try:
-            stdscr.hline(h - 2, 0, curses.ACS_HLINE, max(0, w))
+            screen.attron(curses.color_pair(color_pair))  # cspell:disable-line
+            safe_addnstr(screen, y, 0, left_part + right_part, width - 1)  # cspell:disable-line
+            screen.attroff(curses.color_pair(color_pair))  # cspell:disable-line
         except curses.error:
             pass
-        msg = "Keys: q quit | u unique/detail | l only LISTEN | d docker-only | +/- refresh | Tip: use sudo for full lsof visibility"
-        safe_addnstr(stdscr, h - 1, 0, msg, w - 1)
 
-def main(stdscr):
-    curses.curs_set(0)
+def draw_rows_unique(screen, rows: List[Dict[str, Any]], aliases: Dict[str, Dict[str, str]], start_line: int = 4) -> None:
+    """Draw aggregated port entries in unique mode."""
+    height, width = screen.getmaxyx()  # cspell:disable-line
+    if height <= start_line + 1:
+        return
+
+    max_rows = max(0, height - start_line - 2)
+
+    for i in range(max_rows):
+        y = start_line + i
+
+        # Clear line if no more rows
+        if i >= len(rows):
+            safe_addnstr(screen, y, 0, " " * (width - 1), width - 1)  # cspell:disable-line
+            continue
+
+        row = rows[i]
+        alias = resolve_alias_for_unique_row(row, aliases)
+        state = row.get("state", "")
+
+        # Format the row
+        left_part = (
+            f"{i+1:>3} {row['port']:>6}  {state:<12} {row.get('proc_summary',''):<28} "
+            f"{row.get('container_summary',''):<24} {row.get('image_summary',''):<24} {alias:<18} "
+        )
+        right_part = row.get("note", "")
+
+        # Apply color based on state
+        color_pair = get_state_color_pair(state)
+        try:
+            screen.attron(curses.color_pair(color_pair))  # cspell:disable-line
+            safe_addnstr(screen, y, 0, left_part + right_part, width - 1)  # cspell:disable-line
+            screen.attroff(curses.color_pair(color_pair))  # cspell:disable-line
+        except curses.error:
+            pass
+
+def draw_help(screen) -> None:
+    """Display help screen with all available commands and information."""
+    screen.clear()
+    _, width = screen.getmaxyx()  # cspell:disable-line
+
+    help_text = [
+        "=== Ports Manager Help ===",
+        "",
+        "Hotkeys:",
+        "  q       - quit application",
+        "  u       - toggle unique/detail mode",
+        "  l       - toggle LISTEN-only filter",
+        "  d       - toggle docker-only rows",
+        "  + / -   - change refresh speed",
+        "  a       - add/edit alias for a row (per-entry)",
+        "  x       - delete per-entry alias",
+        "  g       - set/edit global per-process alias",
+        "  ?       - show this help",
+        "  ESC     - close this help screen",
+        "",
+        "Alias Types:",
+        "  • Per-entry alias (a/x): tied to one specific row",
+        "      - Detail mode: process + PID + port",
+        "      - Unique mode: port number only",
+        "  • Per-process alias (g): tied to process name",
+        "      - Applies to ALL rows with that process",
+        "      - Good for permanent names (e.g. mysqld → MySQL)",  # cspell:disable-line
+        "",
+        "Display Modes:",
+        "  • Unique mode: aggregates entries by port number",
+        "  • Detail mode: shows every process separately",
+        "  • LISTEN filter: shows only listening sockets",
+        "  • Docker-only: includes docker-published ports",
+        "",
+        "Tips:",
+        "  • Use 'sudo' for full process visibility",
+        "  • Aliases are saved automatically",
+        "  • Press ESC or any key to return to main view"
+    ]
+
+    for i, line in enumerate(help_text):
+        safe_addnstr(screen, i + 1, 2, line, width - 4)  # cspell:disable-line
+
+    screen.refresh()
+
+    # Wait for ESC key or any other key to close
+    while True:
+        try:
+            key = screen.getch()  # cspell:disable-line
+            if key == 27:  # ESC key
+                break
+            elif key != -1:  # Any other key (except no-key)
+                break
+        except curses.error:
+            break
+
+def draw_footer(screen) -> None:
+    """Draw footer with quick reference and tips."""
+    height, width = screen.getmaxyx()  # cspell:disable-line
+    if height < 6:
+        return
+
+    # Draw horizontal line
+    try:
+        screen.hline(height - 2, 0, curses.ACS_HLINE, width)  # cspell:disable-line
+    except curses.error:
+        pass
+
+    # Footer message
+    footer_msg = (
+        "Keys: [q] quit | [u] mode | [l] LISTEN | [d] docker | [+/-] refresh | "
+        "[a] alias | [x] delete | [g] process | [?] help | Tip: use sudo for full visibility"
+    )
+    safe_addnstr(screen, height - 1, 0, footer_msg, width - 1)  # cspell:disable-line
+
+# =========================
+# Process Selection for Aliases
+# =========================
+def choose_proc_for_alias(
+    screen,
+    unique_mode: bool,
+    detail_entries: List[PortEntry],
+    unique_rows: List[Dict[str, Any]]
+) -> Tuple[str, str]:
+    """
+    Get process name for per-process alias.
+    User can enter a row number or process name directly.
+    Returns: (process_name, current_alias)
+    """
+    prompt = "Row number or process name: "
+    user_input = get_user_input(screen, prompt)
+
+    if not user_input:
+        return "", ""
+
+    # Check if input is a row number
+    if user_input.isdigit():
+        try:
+            row_idx = int(user_input) - 1
+
+            if unique_mode:
+                if 0 <= row_idx < len(unique_rows):
+                    row = unique_rows[row_idx]
+                    proc_summary = row.get("proc_summary", "")
+                    if proc_summary:
+                        # Get first process from summary
+                        first_proc = proc_summary.split(",")[0].strip()
+                        return first_proc, ""
+            else:
+                if 0 <= row_idx < len(detail_entries):
+                    entry = detail_entries[row_idx]
+                    return entry.proc.strip(), ""
+
+        except (ValueError, IndexError):
+            pass
+
+        return "", ""
+
+    # Treat as direct process name input
+    return user_input.strip(), ""
+
+# =========================
+# Main Application
+# =========================
+def initialize_curses(screen) -> None:
+    """Initialize curses settings and color pairs."""
+    curses.curs_set(0)  # Hide cursor  # cspell:disable-line
     curses.use_default_colors()
-    curses.init_pair(1, -1, -1)                 # default
+    curses.init_pair(1, -1, -1)                 # Default
     curses.init_pair(2, curses.COLOR_GREEN, -1) # LISTEN/PUBLISHED
     curses.init_pair(3, curses.COLOR_CYAN, -1)  # ESTABLISHED
+    screen.nodelay(True)  # Non-blocking input  # cspell:disable-line
 
+def main(screen) -> None:
+    """Main application loop."""
+    initialize_curses(screen)
+
+    # Application state
     refresh_secs = REFRESH_SECS_DEFAULT
-    only_listen = True          # default ON
+    only_listen = True
     show_docker_only = True
-    unique_mode = True          # default ON
-    stdscr.nodelay(True)
+    unique_mode = True
+    last_refresh = 0.0
 
-    last_refresh = 0
-    rows_detail = []
-    rows_unique = []
+    # Load aliases
+    aliases = load_aliases()
+
+    # Data storage
+    detail_entries: List[PortEntry] = []
+    unique_rows: List[Dict[str, Any]] = []
 
     while True:
-        now = time.time()
-        if now - last_refresh >= refresh_secs:
+        current_time = time.time()
+
+        # Refresh data if needed
+        if current_time - last_refresh >= refresh_secs:
+            # Get lsof data
             lsof_lines = run_lsof(only_listen)
-            host_rows = parse_lsof(lsof_lines)
-            docker_map, docker_only_rows = docker_port_map()
-            rows_detail = merge_rows(host_rows, docker_map, docker_only_rows, show_docker_only)
-            rows_unique = aggregate_unique_ports(rows_detail)
+            host_entries = parse_lsof(lsof_lines)
 
-            stdscr.erase()
-            draw_header(stdscr, only_listen, refresh_secs, show_docker_only, unique_mode)
+            # Get Docker data
+            docker_host_map, docker_only_entries = docker_port_map()
+
+            # Merge and aggregate
+            detail_entries = merge_rows(host_entries, docker_host_map, docker_only_entries, show_docker_only)
+            unique_rows = aggregate_unique_ports(detail_entries)
+
+            # Redraw screen
+            screen.erase()
+            draw_header(screen, only_listen, refresh_secs, show_docker_only, unique_mode)
+
             if unique_mode:
-                draw_rows_unique(stdscr, rows_unique)
+                draw_rows_unique(screen, unique_rows, aliases)
             else:
-                draw_rows_detail(stdscr, rows_detail)
-            draw_footer(stdscr)
-            stdscr.refresh()
-            last_refresh = now
+                draw_rows_detail(screen, detail_entries, aliases)
 
+            draw_footer(screen)
+            screen.refresh()
+            last_refresh = current_time
+
+        # Handle input
         try:
-            ch = stdscr.getch()
+            key = screen.getch()  # cspell:disable-line
         except curses.error:
-            ch = -1
+            key = -1
 
-        if ch == ord('q'):
+        if key == ord('q'):
             break
-        elif ch == ord('l'):
+        elif key == ord('l'):
             only_listen = not only_listen
             last_refresh = 0
-        elif ch == ord('d'):
+        elif key == ord('d'):
             show_docker_only = not show_docker_only
             last_refresh = 0
-        elif ch == ord('u'):
+        elif key == ord('u'):
             unique_mode = not unique_mode
             last_refresh = 0
-        elif ch in (ord('+'), ord('=')):
+        elif key in (ord('+'), ord('=')):
             refresh_secs = max(0.2, refresh_secs - 0.2)
             last_refresh = 0
-        elif ch in (ord('-'), ord('_')):
+        elif key in (ord('-'), ord('_')):
             refresh_secs = min(10.0, refresh_secs + 0.2)
+            last_refresh = 0
+        elif key == ord('a'):
+            # Add/Edit per-entry alias
+            handle_add_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+            last_refresh = 0
+        elif key == ord('x'):
+            # Delete per-entry alias
+            handle_delete_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+            last_refresh = 0
+        elif key == ord('g'):
+            # Set/Edit per-process alias
+            handle_process_alias(screen, unique_mode, detail_entries, unique_rows, aliases)
+            last_refresh = 0
+        elif key == ord('?'):
+            draw_help(screen)
             last_refresh = 0
 
         time.sleep(0.05)
 
-if __name__ == "__main__":
+def handle_add_alias(
+    screen,
+    unique_mode: bool,
+    detail_entries: List[PortEntry],
+    unique_rows: List[Dict[str, Any]],
+    aliases: Dict[str, Dict[str, str]]
+) -> None:
+    """Handle adding/editing per-entry aliases."""
+    current_data = unique_rows if unique_mode else detail_entries
+    if not current_data:
+        return
+
+    row_input = get_user_input(screen, "Row number to alias: ")
+    try:
+        row_idx = int(row_input) - 1
+        if not (0 <= row_idx < len(current_data)):
+            return
+    except ValueError:
+        return
+
+    if unique_mode:
+        row = unique_rows[row_idx]
+        existing = resolve_alias_for_unique_row(row, aliases)
+        key = per_entry_key_unique(row["port"])
+    else:
+        entry = detail_entries[row_idx]
+        existing = resolve_alias(entry, unique_mode=False, aliases=aliases)
+        key = per_entry_key_detail(entry)
+
+    prompt = f"Alias [{existing}]: " if existing else "Alias: "
+    new_alias = get_user_input(screen, prompt)
+
+    if new_alias:
+        aliases["per_entry"][key] = new_alias
+        save_aliases(aliases)
+
+def handle_delete_alias(
+    screen,
+    unique_mode: bool,
+    detail_entries: List[PortEntry],
+    unique_rows: List[Dict[str, Any]],
+    aliases: Dict[str, Dict[str, str]]
+) -> None:
+    """Handle deleting per-entry aliases."""
+    current_data = unique_rows if unique_mode else detail_entries
+    if not current_data:
+        return
+
+    row_input = get_user_input(screen, "Row number to clear alias: ")
+    try:
+        row_idx = int(row_input) - 1
+        if not (0 <= row_idx < len(current_data)):
+            return
+    except ValueError:
+        return
+
+    if unique_mode:
+        row = unique_rows[row_idx]
+        key = per_entry_key_unique(row["port"])
+    else:
+        entry = detail_entries[row_idx]
+        key = per_entry_key_detail(entry)
+
+    if key in aliases["per_entry"]:
+        del aliases["per_entry"][key]
+        save_aliases(aliases)
+
+def handle_process_alias(
+    screen,
+    unique_mode: bool,
+    detail_entries: List[PortEntry],
+    unique_rows: List[Dict[str, Any]],
+    aliases: Dict[str, Dict[str, str]]
+) -> None:
+    """Handle setting/editing per-process aliases."""
+    proc_name, _ = choose_proc_for_alias(screen, unique_mode, detail_entries, unique_rows)
+    if not proc_name:
+        return
+
+    current_alias = aliases["per_proc"].get(proc_name) or BUILTIN_FRIENDLY.get(proc_name, "")
+    prompt = f"Alias for '{proc_name}' [{current_alias}]: " if current_alias else f"Alias for '{proc_name}': "
+
+    new_alias = get_user_input(screen, prompt)
+    if new_alias:
+        aliases["per_proc"][proc_name] = new_alias
+        save_aliases(aliases)
+
+# =========================
+# Entry Point
+# =========================
+def check_dependencies() -> None:
+    """Check that required system dependencies are available."""
     if not shutil.which("lsof"):
-        print("Error: lsof not found. Install with: brew install lsof")
+        print("Error: lsof not found. Install with: brew install lsof (macOS) or apt install lsof (Linux)")
         raise SystemExit(1)
-    curses.wrapper(main)
+
+if __name__ == "__main__":
+    try:
+        check_dependencies()
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise SystemExit(1)
