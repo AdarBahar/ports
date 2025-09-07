@@ -23,7 +23,7 @@ from typing import Dict, List, Set, Optional, Any, Tuple
 # =========================
 # Configuration
 # =========================
-VERSION = "2.1.0"  # Current version (testing auto-update)
+VERSION = "2.1.2"  # Current version (testing auto-update)
 GITHUB_REPO = "AdarBahar/ports"  # GitHub repository  # cspell:disable-line
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ports"
@@ -1117,7 +1117,7 @@ def handle_port_configuration(screen) -> bool:
     screen.refresh()
 
     # Get user input
-    input_text = get_user_input(screen, input_y, 2 + len(prompt), width - 4 - len(prompt), 100)
+    input_text = get_user_input(screen, prompt)
 
     if input_text is None:  # ESC pressed
         return False

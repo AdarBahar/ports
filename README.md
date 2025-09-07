@@ -6,7 +6,7 @@ A powerful, feature-rich terminal-based tool for monitoring network ports and pr
 ![Python Version](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 ![SPDX License](https://img.shields.io/badge/SPDX--License--Identifier-MIT-blue)
-![Version](https://img.shields.io/badge/Version-2.1.1-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.1.2-brightgreen)
 ![Auto Update](https://img.shields.io/badge/Auto--Update-✅-success)
 
 ## ✨ Features
@@ -265,7 +265,7 @@ Press any other key to continue with current version
 - **Non-blocking** - doesn't delay startup if GitHub is slow
 
 ### Version Display
-- **Header shows version** - `Ports Manager by Adar Bahar v2.1.1`  <!-- cspell:disable-line -->
+- **Header shows version** - `Ports Manager by Adar Bahar v2.1.2`  <!-- cspell:disable-line -->
 - **Instant visibility** - see your current version immediately
 - **No command needed** - version always visible in interface
 
@@ -276,7 +276,7 @@ Edit the constants at the top of the `ports` script:
 
 ```python
 # Configuration section
-VERSION = "2.1.1"                       # Current version (auto-managed)
+VERSION = "2.1.2"                       # Current version (auto-managed)
 LO_PORT, HI_PORT = 3000, 9999          # Port range to monitor
 REFRESH_SECS_DEFAULT = 2.0              # Default refresh interval
 COMMAND_TIMEOUT_SECS = 10.0             # Timeout for external commands
