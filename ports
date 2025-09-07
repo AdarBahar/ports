@@ -549,6 +549,27 @@ def safe_addnstr(screen, y: int, x: int, text: str, max_width: int) -> None:  # 
         # Ignore curses errors (e.g., writing to bottom-right corner)
         pass
 
+def show_message(screen, message: str, wait_for_key: bool = True) -> None:
+    """Display a message at the bottom of the screen."""
+    try:
+        height, width = screen.getmaxyx()  # cspell:disable-line
+    except curses.error:
+        height, width = 24, 80
+
+    message_line = height - 1
+
+    try:
+        screen.move(message_line, 0)
+        screen.clrtoeol()  # cspell:disable-line
+        safe_addnstr(screen, message_line, 0, message, width - 1)  # cspell:disable-line
+        screen.refresh()
+
+        if wait_for_key:
+            # Wait for any key press
+            screen.getch()  # cspell:disable-line
+    except curses.error:
+        pass
+
 def get_user_input(screen, prompt: str) -> str:
     """Get user input from the bottom line of the screen with resize handling."""
     curses.echo()
@@ -802,41 +823,61 @@ def choose_proc_for_alias(
     unique_rows: List[Dict[str, Any]]
 ) -> Tuple[str, str]:
     """
-    Get process name for per-process alias.
+    Get process name for per-process alias with validation.
     User can enter a row number or process name directly.
     Returns: (process_name, current_alias)
     """
-    prompt = "Row number or process name: "
-    user_input = get_user_input(screen, prompt)
-
-    if not user_input:
+    current_data = unique_rows if unique_mode else detail_entries
+    if not current_data:
+        show_message(screen, "No data available. Press any key to continue...")
         return "", ""
 
-    # Check if input is a row number
-    if user_input.isdigit():
-        try:
-            row_idx = int(user_input) - 1
+    # Get input with validation loop
+    while True:
+        prompt = f"Row number (1-{len(current_data)}) or process name (or press Enter to cancel): "
+        user_input = get_user_input(screen, prompt)
 
-            if unique_mode:
-                if 0 <= row_idx < len(unique_rows):
-                    row = unique_rows[row_idx]
-                    proc_summary = row.get("proc_summary", "")
-                    if proc_summary:
-                        # Get first process from summary
-                        first_proc = proc_summary.split(",")[0].strip()
-                        return first_proc, ""
-            else:
-                if 0 <= row_idx < len(detail_entries):
-                    entry = detail_entries[row_idx]
-                    return entry.proc.strip(), ""
+        if not user_input:
+            return "", ""
 
-        except (ValueError, IndexError):
-            pass
+        # Check if input is a row number
+        if user_input.isdigit():
+            try:
+                row_idx = int(user_input) - 1
 
-        return "", ""
+                if unique_mode:
+                    if 0 <= row_idx < len(unique_rows):
+                        row = unique_rows[row_idx]
+                        proc_summary = row.get("proc_summary", "")
+                        if proc_summary:
+                            # Get first process from summary
+                            first_proc = proc_summary.split(",")[0].strip()
+                            return first_proc, ""
+                        else:
+                            show_message(screen, f"No process information for row {user_input}. Press any key to try again...")
+                            continue
+                    else:
+                        show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                        continue
+                else:
+                    if 0 <= row_idx < len(detail_entries):
+                        entry = detail_entries[row_idx]
+                        return entry.proc.strip(), ""
+                    else:
+                        show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                        continue
 
-    # Treat as direct process name input
-    return user_input.strip(), ""
+            except (ValueError, IndexError):
+                show_message(screen, "Invalid row number. Press any key to try again...")
+                continue
+
+        # Treat as direct process name input
+        proc_name = user_input.strip()
+        if proc_name:
+            return proc_name, ""
+        else:
+            show_message(screen, "Process name cannot be empty. Press any key to try again...")
+            continue
 
 # =========================
 # Main Application
@@ -955,34 +996,49 @@ def handle_add_alias(
     """Handle adding/editing per-entry aliases with validation."""
     current_data = unique_rows if unique_mode else detail_entries
     if not current_data:
-        get_user_input(screen, "No data available. Press Enter to continue...")
+        show_message(screen, "No data available. Press any key to continue...")
         return
 
-    row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to alias: ")
-    try:
-        row_idx = int(row_input) - 1
-        if not (0 <= row_idx < len(current_data)):
-            get_user_input(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press Enter...")
+    # Get row number with validation loop
+    while True:
+        row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to alias (or press Enter to cancel): ")
+
+        # Allow user to cancel
+        if not row_input:
             return
-    except ValueError:
-        get_user_input(screen, "Invalid input. Please enter a number. Press Enter...")
-        return
 
+        try:
+            row_idx = int(row_input) - 1
+            if 0 <= row_idx < len(current_data):
+                break  # Valid input, exit loop
+            else:
+                show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+        except ValueError:
+            show_message(screen, "Invalid input. Please enter a number. Press any key to try again...")
+
+    # Get the alias
     if unique_mode:
         row = unique_rows[row_idx]
         existing = resolve_alias_for_unique_row(row, aliases)
         key = per_entry_key_unique(row["port"])
+        port_info = f"port {row['port']}"
     else:
         entry = detail_entries[row_idx]
         existing = resolve_alias(entry, unique_mode=False, aliases=aliases)
         key = per_entry_key_detail(entry)
+        port_info = f"{entry.proc} (PID {entry.pid}) on port {entry.port}"
 
-    prompt = f"Alias [{existing}]: " if existing else "Alias: "
+    prompt = f"Alias for {port_info} [{existing}]: " if existing else f"Alias for {port_info}: "
     new_alias = get_user_input(screen, prompt)
 
     if new_alias:
         aliases["per_entry"][key] = new_alias
         save_aliases(aliases)
+        show_message(screen, f"Alias '{new_alias}' saved for {port_info}. Press any key to continue...")
+    elif existing:
+        show_message(screen, f"Keeping existing alias '{existing}'. Press any key to continue...")
+    else:
+        show_message(screen, "No alias set. Press any key to continue...")
 
 def handle_delete_alias(
     screen,
@@ -994,32 +1050,43 @@ def handle_delete_alias(
     """Handle deleting per-entry aliases with validation."""
     current_data = unique_rows if unique_mode else detail_entries
     if not current_data:
-        get_user_input(screen, "No data available. Press Enter to continue...")
+        show_message(screen, "No data available. Press any key to continue...")
         return
 
-    row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to clear alias: ")
-    try:
-        row_idx = int(row_input) - 1
-        if not (0 <= row_idx < len(current_data)):
-            get_user_input(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press Enter...")
+    # Get row number with validation loop
+    while True:
+        row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to clear alias (or press Enter to cancel): ")
+
+        # Allow user to cancel
+        if not row_input:
             return
-    except ValueError:
-        get_user_input(screen, "Invalid input. Please enter a number. Press Enter...")
-        return
 
+        try:
+            row_idx = int(row_input) - 1
+            if 0 <= row_idx < len(current_data):
+                break  # Valid input, exit loop
+            else:
+                show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+        except ValueError:
+            show_message(screen, "Invalid input. Please enter a number. Press any key to try again...")
+
+    # Delete the alias
     if unique_mode:
         row = unique_rows[row_idx]
         key = per_entry_key_unique(row["port"])
+        port_info = f"port {row['port']}"
     else:
         entry = detail_entries[row_idx]
         key = per_entry_key_detail(entry)
+        port_info = f"{entry.proc} (PID {entry.pid}) on port {entry.port}"
 
     if key in aliases["per_entry"]:
+        old_alias = aliases["per_entry"][key]
         del aliases["per_entry"][key]
         save_aliases(aliases)
-        get_user_input(screen, "Alias deleted. Press Enter to continue...")
+        show_message(screen, f"Alias '{old_alias}' deleted for {port_info}. Press any key to continue...")
     else:
-        get_user_input(screen, "No alias found for this row. Press Enter to continue...")
+        show_message(screen, f"No alias found for {port_info}. Press any key to continue...")
 
 def handle_process_alias(
     screen,
@@ -1034,12 +1101,17 @@ def handle_process_alias(
         return
 
     current_alias = aliases["per_proc"].get(proc_name) or BUILTIN_FRIENDLY.get(proc_name, "")
-    prompt = f"Alias for '{proc_name}' [{current_alias}]: " if current_alias else f"Alias for '{proc_name}': "
+    prompt = f"Alias for process '{proc_name}' [{current_alias}]: " if current_alias else f"Alias for process '{proc_name}': "
 
     new_alias = get_user_input(screen, prompt)
     if new_alias:
         aliases["per_proc"][proc_name] = new_alias
         save_aliases(aliases)
+        show_message(screen, f"Process alias '{new_alias}' saved for '{proc_name}'. Press any key to continue...")
+    elif current_alias:
+        show_message(screen, f"Keeping existing alias '{current_alias}' for '{proc_name}'. Press any key to continue...")
+    else:
+        show_message(screen, f"No alias set for '{proc_name}'. Press any key to continue...")
 
 # =========================
 # Entry Point
