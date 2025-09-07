@@ -571,7 +571,7 @@ def show_message(screen, message: str, wait_for_key: bool = True) -> None:
         pass
 
 def get_user_input(screen, prompt: str) -> str:
-    """Get user input from the bottom line of the screen with resize handling."""
+    """Get user input from the bottom line of the screen with ESC support."""
     curses.echo()
     try:
         # Handle potential terminal resize during input
@@ -593,13 +593,42 @@ def get_user_input(screen, prompt: str) -> str:
             # Handle resize during drawing
             pass
 
-        # Get user input with resize protection
+        # Get user input with ESC detection
+        input_text = ""
+        cursor_pos = len(prompt)
+
         try:
-            max_input_len = max(10, width - len(prompt) - 2)  # Leave some margin
-            user_bytes = screen.getstr(input_line, len(prompt), max_input_len)  # cspell:disable-line
-            return user_bytes.decode("utf-8").strip()
-        except (UnicodeDecodeError, curses.error):
-            return ""
+            screen.move(input_line, cursor_pos)
+            while True:
+                key = screen.getch()  # cspell:disable-line
+
+                if key == 27:  # ESC key
+                    return ""  # Return empty string to indicate cancellation
+                elif key == ord('\n') or key == ord('\r') or key == curses.KEY_ENTER:
+                    break  # Enter pressed, return current input
+                elif key == curses.KEY_BACKSPACE or key == 127 or key == 8:
+                    # Backspace
+                    if input_text:
+                        input_text = input_text[:-1]
+                        cursor_pos -= 1
+                        try:
+                            screen.move(input_line, cursor_pos)
+                            screen.delch()  # cspell:disable-line
+                        except curses.error:
+                            pass
+                elif 32 <= key <= 126:  # Printable ASCII characters
+                    if len(input_text) < 100:  # Reasonable limit
+                        input_text += chr(key)
+                        cursor_pos += 1
+                        try:
+                            screen.addch(key)  # cspell:disable-line
+                        except curses.error:
+                            pass
+
+        except curses.error:
+            pass
+
+        return input_text.strip()
     finally:
         curses.noecho()  # cspell:disable-line
 
@@ -833,8 +862,12 @@ def choose_proc_for_alias(
         return "", ""
 
     # Get input with validation loop
+    error_msg = ""
     while True:
-        prompt = f"Row number (1-{len(current_data)}) or process name (or press Enter to cancel): "
+        prompt = f"Row number (1-{len(current_data)}) or process name (ESC to cancel): "
+        if error_msg:
+            prompt = f"{error_msg} | {prompt}"
+
         user_input = get_user_input(screen, prompt)
 
         if not user_input:
@@ -854,21 +887,21 @@ def choose_proc_for_alias(
                             first_proc = proc_summary.split(",")[0].strip()
                             return first_proc, ""
                         else:
-                            show_message(screen, f"No process information for row {user_input}. Press any key to try again...")
+                            error_msg = f"No process info for row {user_input}"
                             continue
                     else:
-                        show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                        error_msg = f"Invalid row (must be 1-{len(current_data)})"
                         continue
                 else:
                     if 0 <= row_idx < len(detail_entries):
                         entry = detail_entries[row_idx]
                         return entry.proc.strip(), ""
                     else:
-                        show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                        error_msg = f"Invalid row (must be 1-{len(current_data)})"
                         continue
 
             except (ValueError, IndexError):
-                show_message(screen, "Invalid row number. Press any key to try again...")
+                error_msg = "Invalid row number"
                 continue
 
         # Treat as direct process name input
@@ -876,7 +909,7 @@ def choose_proc_for_alias(
         if proc_name:
             return proc_name, ""
         else:
-            show_message(screen, "Process name cannot be empty. Press any key to try again...")
+            error_msg = "Process name cannot be empty"
             continue
 
 # =========================
@@ -1000,10 +1033,15 @@ def handle_add_alias(
         return
 
     # Get row number with validation loop
+    error_msg = ""
     while True:
-        row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to alias (or press Enter to cancel): ")
+        prompt = f"Row number (1-{len(current_data)}) to alias (ESC to cancel): "
+        if error_msg:
+            prompt = f"{error_msg} | {prompt}"
 
-        # Allow user to cancel
+        row_input = get_user_input(screen, prompt)
+
+        # Check for ESC key (empty input can mean ESC or just Enter)
         if not row_input:
             return
 
@@ -1012,9 +1050,9 @@ def handle_add_alias(
             if 0 <= row_idx < len(current_data):
                 break  # Valid input, exit loop
             else:
-                show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                error_msg = f"Invalid row (must be 1-{len(current_data)})"
         except ValueError:
-            show_message(screen, "Invalid input. Please enter a number. Press any key to try again...")
+            error_msg = "Please enter a number"
 
     # Get the alias
     if unique_mode:
@@ -1034,11 +1072,11 @@ def handle_add_alias(
     if new_alias:
         aliases["per_entry"][key] = new_alias
         save_aliases(aliases)
-        show_message(screen, f"Alias '{new_alias}' saved for {port_info}. Press any key to continue...")
+        show_message(screen, f"✓ Alias '{new_alias}' saved for {port_info}")
     elif existing:
-        show_message(screen, f"Keeping existing alias '{existing}'. Press any key to continue...")
+        show_message(screen, f"✓ Keeping existing alias '{existing}'")
     else:
-        show_message(screen, "No alias set. Press any key to continue...")
+        show_message(screen, "✓ No alias set")
 
 def handle_delete_alias(
     screen,
@@ -1054,10 +1092,15 @@ def handle_delete_alias(
         return
 
     # Get row number with validation loop
+    error_msg = ""
     while True:
-        row_input = get_user_input(screen, f"Row number (1-{len(current_data)}) to clear alias (or press Enter to cancel): ")
+        prompt = f"Row number (1-{len(current_data)}) to clear alias (ESC to cancel): "
+        if error_msg:
+            prompt = f"{error_msg} | {prompt}"
 
-        # Allow user to cancel
+        row_input = get_user_input(screen, prompt)
+
+        # Check for ESC key (empty input can mean ESC or just Enter)
         if not row_input:
             return
 
@@ -1066,9 +1109,9 @@ def handle_delete_alias(
             if 0 <= row_idx < len(current_data):
                 break  # Valid input, exit loop
             else:
-                show_message(screen, f"Invalid row number. Must be 1-{len(current_data)}. Press any key to try again...")
+                error_msg = f"Invalid row (must be 1-{len(current_data)})"
         except ValueError:
-            show_message(screen, "Invalid input. Please enter a number. Press any key to try again...")
+            error_msg = "Please enter a number"
 
     # Delete the alias
     if unique_mode:
@@ -1084,9 +1127,9 @@ def handle_delete_alias(
         old_alias = aliases["per_entry"][key]
         del aliases["per_entry"][key]
         save_aliases(aliases)
-        show_message(screen, f"Alias '{old_alias}' deleted for {port_info}. Press any key to continue...")
+        show_message(screen, f"✓ Alias '{old_alias}' deleted for {port_info}")
     else:
-        show_message(screen, f"No alias found for {port_info}. Press any key to continue...")
+        show_message(screen, f"✓ No alias found for {port_info}")
 
 def handle_process_alias(
     screen,
@@ -1107,11 +1150,11 @@ def handle_process_alias(
     if new_alias:
         aliases["per_proc"][proc_name] = new_alias
         save_aliases(aliases)
-        show_message(screen, f"Process alias '{new_alias}' saved for '{proc_name}'. Press any key to continue...")
+        show_message(screen, f"✓ Process alias '{new_alias}' saved for '{proc_name}'")
     elif current_alias:
-        show_message(screen, f"Keeping existing alias '{current_alias}' for '{proc_name}'. Press any key to continue...")
+        show_message(screen, f"✓ Keeping existing alias '{current_alias}' for '{proc_name}'")
     else:
-        show_message(screen, f"No alias set for '{proc_name}'. Press any key to continue...")
+        show_message(screen, f"✓ No alias set for '{proc_name}'")
 
 # =========================
 # Entry Point
